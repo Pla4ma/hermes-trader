@@ -41,4 +41,6 @@ build/
 
 # OS
 .DS_Store
-Thumbs.db
+Thumbs.db__pycache__/
+.venv/
+.pytest_cache/
