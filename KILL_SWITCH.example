@@ -1,0 +1,15 @@
+# KILL_SWITCH
+# 
+# Create this file to emergency-stop all trading.
+# 
+# When /opt/hermes-trader/KILL_SWITCH exists:
+#   - No new orders (paper or live)
+#   - Position monitoring continues
+#   - Exit management allowed only to reduce risk
+#   - Telegram reports indicate KILL SWITCH ACTIVE
+#
+# To activate:  touch /opt/hermes-trader/KILL_SWITCH
+# To deactivate: rm /opt/hermes-trader/KILL_SWITCH (user only, not agent)
+#
+# The agent will never create or remove this file.
+# Only the user may manage it.

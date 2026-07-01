@@ -1,0 +1,44 @@
+# Secrets
+.env
+*.key
+*.pem
+credentials.json
+auth.json
+
+# Kill switch (user-managed, do not track)
+KILL_SWITCH
+
+# Lock files
+RUNNING.lock
+*.lock
+
+# Logs
+logs/
+*.log
+
+# Data (runtime-generated)
+data/backtests/
+data/research/
+data/journals/
+data/snapshots/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
