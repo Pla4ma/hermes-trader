@@ -23,7 +23,7 @@ class TradingAgentsClient:
 
     def __init__(self, agents_path: str = "/opt/vendor/TradingAgents"):
         self.agents_path = Path(agents_path)
-        # Ensure FREELLMAPI env vars are set for subprocess/sys.path import
+        # Ensure CMDDD env vars are set for subprocess/sys.path import
         import os
         if "OPENAI_API_KEY" not in os.environ:
             os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY", "")
