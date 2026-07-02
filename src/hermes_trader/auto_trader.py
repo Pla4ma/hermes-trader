@@ -160,7 +160,10 @@ def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
         return result
 
     best = viable[0]
-    notional = min(cash * 0.9, max_notional)
+    notional = min(cash * 0.9, max_notional) * sizing_mult
+
+    # Use optimal params if available
+    opt_params = _load_optimal_params(best["symbol"])
 
     # Execute trade
     try:
@@ -208,6 +211,19 @@ def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
         logger.error(f"Auto-trade failed: {e}")
 
     return result
+
+
+def _load_optimal_params(symbol: str) -> dict:
+    """Load optimal backtest parameters for a symbol."""
+    try:
+        params_file = "/opt/hermes-trader/data/snapshots/optimal_params.json"
+        if os.path.exists(params_file):
+            with open(params_file) as f:
+                all_params = json.load(f)
+            return all_params.get(symbol, {}).get("params", {})
+    except Exception:
+        pass
+    return {}
 
 
 def manage_exits() -> dict:
