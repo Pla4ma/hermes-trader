@@ -46,21 +46,31 @@ class TradingAgentsClient:
             date = datetime.utcnow().strftime("%Y-%m-%d")
 
         try:
-            cmd = [
-                "python3", "-c",
-                f"import os, sys; os.environ.update({{'OPENAI_API_KEY': os.getenv('OPENAI_API_KEY',''), 'OPENAI_BASE_URL': os.getenv('OPENAI_BASE_URL','https://api.commandcode.ai/provider/v1')}}); sys.path.insert(0, '{self.agents_path}'); "
+            script = (
+                f"import os, sys; "
+                f"sys.path.insert(0, '{self.agents_path}'); "
                 f"from tradingagents.graph.trading_graph import TradingAgentsGraph; "
                 f"from tradingagents.default_config import DEFAULT_CONFIG; "
-                f"ta = TradingAgentsGraph(config=DEFAULT_CONFIG); "
+                f"config = dict(DEFAULT_CONFIG); "
+                f"config['llm_provider'] = 'openai_compatible'; "
+                f"config['backend_url'] = os.environ.get('OPENAI_BASE_URL', 'https://api.commandcode.ai/provider/v1'); "
+                f"config['deep_think_llm'] = os.environ.get('TRADINGAGENTS_DEEP_THINK_LLM', 'xiaomi/mimo-v2.5-pro'); "
+                f"config['quick_think_llm'] = os.environ.get('TRADINGAGENTS_QUICK_THINK_LLM', 'xiaomi/mimo-v2.5-pro'); "
+                f"ta = TradingAgentsGraph(config=config); "
                 f"result = ta.propagate('{symbol}', '{date}'); "
                 f"print(result[1] if len(result) > 1 else result)"
-            ]
+            )
+            cmd = ["/opt/hermes-trader/.venv/bin/python", "-c", script]
+            # Pass CMDDD env vars through subprocess env parameter
+            sub_env = {**os.environ}
+            sub_env["OPENAI_COMPATIBLE_API_KEY"] = os.environ.get("OPENAI_API_KEY", "")
             r = subprocess.run(
                 cmd,
                 cwd=str(self.agents_path),
                 capture_output=True,
                 text=True,
                 timeout=180,
+                env=sub_env,
             )
             return {
                 "status": "COMPLETED",

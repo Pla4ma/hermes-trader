@@ -38,7 +38,7 @@ class VibeTradingClient:
             return {"status": "SKIPPED", "reason": "Vibe-Trading path not found"}
 
         try:
-            cmd = ["python3", "-m", "cli", "research", "--symbol", symbol]
+            cmd = ["/opt/hermes-trader/.venv/bin/python", "-m", "cli", "research", "--symbol", symbol]
             r = subprocess.run(
                 cmd,
                 cwd=str(self.vibe_path / "agent"),
@@ -66,7 +66,7 @@ class VibeTradingClient:
             return {"status": "SKIPPED", "reason": "Vibe-Trading path not found"}
 
         try:
-            cmd = ["python3", "-m", "cli", "backtest", "--symbol", symbol, "--strategy", strategy]
+            cmd = ["/opt/hermes-trader/.venv/bin/python", "-m", "cli", "backtest", "--symbol", symbol, "--strategy", strategy]
             r = subprocess.run(
                 cmd,
                 cwd=str(self.vibe_path / "agent"),
