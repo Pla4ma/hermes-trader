@@ -152,14 +152,14 @@ class PremiumSellerEngine:
             "cash": cash,
         }
 
-    def find_credit_spread(self, direction: str = "put", width: int = 2,
-                           target_delta: float = 0.20, max_dte: int = 1) -> dict:
+    def find_credit_spread(self, direction: str = "put", width: int = 1,
+                           target_delta: float = 0.16, max_dte: int = 1) -> dict:
         """Find the best credit spread to sell.
 
         Args:
             direction: "put" for bull put spread, "call" for bear call spread
-            width: Spread width in dollars (1, 2, 5)
-            target_delta: Target delta for short leg (0.20 = 20% OTM)
+            width: Spread width in dollars — RESEARCH: $1-wide for $50 accounts
+            target_delta: Target delta — RESEARCH: 16 delta = tastylive sweet spot (84% WR)
             max_dte: Days to expiration (1 = 0DTE)
         """
         from alpaca.data.requests import OptionChainRequest
@@ -272,7 +272,7 @@ class PremiumSellerEngine:
             "breakeven": round(short_leg["strike"] - credit, 2) if direction == "put" else round(short_leg["strike"] + credit, 2),
         }
 
-    def find_iron_condor(self, width: int = 2, target_delta: float = 0.20,
+    def find_iron_condor(self, width: int = 1, target_delta: float = 0.16,
                          max_dte: int = 1) -> dict:
         """Find an iron condor (sell both put and call spreads)."""
         put_spread = self.find_credit_spread("put", width, target_delta, max_dte)
@@ -301,45 +301,6 @@ class PremiumSellerEngine:
             "width": width,
             "estimated_win_rate": round((1 - target_delta) * 100, 1),
             "profit_zone": f"{put_spread['breakeven']:.0f} - {call_spread['breakeven']:.0f}",
-        }
-
-    def select_strategy(self) -> dict:
-        """Select the best premium-selling strategy."""
-        filters = self.check_filters()
-        vix = filters["vix"]
-        regime = filters["regime"]
-
-        if not filters["should_trade"]:
-            return {
-                "action": "wait",
-                "reason": f"Filters blocking: {', '.join(filters['blocking'])}",
-                "filters": filters,
-            }
-
-        # Strategy selection
-        if "BEAR" in regime:
-            # Bearish — sell call spreads
-            strategy = "bear_call_spread"
-            direction = "call"
-        elif "BULL" in regime:
-            # Bullish — sell put spreads
-            strategy = "bull_put_spread"
-            direction = "put"
-        elif vix["vix"] > 20:
-            # High vol, neutral — iron condor
-            strategy = "iron_condor"
-            direction = "both"
-        else:
-            # Default — sell put spreads (bullish bias)
-            strategy = "bull_put_spread"
-            direction = "put"
-
-        return {
-            "action": "trade",
-            "strategy": strategy,
-            "direction": direction,
-            "filters": filters,
-            "reason": f"{regime} regime, VIX {vix['vix']:.1f}, contango {vix['term_ratio']:.2f}",
         }
 
     def find_best_trade(self) -> dict:
@@ -503,6 +464,83 @@ class PremiumSellerEngine:
             return float(self.trading_client.get_account().cash)
         except Exception:
             return 0.0
+
+    def get_day_of_week(self) -> dict:
+        from datetime import timezone
+        now = datetime.now(timezone.utc)
+        et_hour = now.hour - 4
+        et_time = et_hour + now.minute / 60
+        now_et = now - timedelta(days=1) if et_time < 0 else now
+        day = now_et.weekday()
+        names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+        return {"day_name": names[day], "is_wednesday": day == 2, "is_friday": day == 4,
+                "rating": "BEST" if day == 2 else ("GOOD" if day in [1, 3] else ("AVOID" if day == 4 else "OK"))}
+
+    def kelly_size(self, win_rate, avg_win, avg_loss, fraction=0.10):
+        if avg_win <= 0 or avg_loss <= 0: return 0
+        return max(0, ((win_rate * avg_win - (1 - win_rate) * avg_loss) / avg_win) * fraction)
+
+    def get_iv_rank(self, symbol="SPY"):
+        try:
+            from alpaca.data.requests import OptionChainRequest
+            today = datetime.utcnow().date()
+            req = OptionChainRequest(underlying_symbol=symbol, expiration_date_gte=today, expiration_date_lte=today + timedelta(days=7))
+            chain = self.opt_client.get_option_chain(req)
+            current_iv = 0.15
+            for sym_name, snap in chain.items():
+                if "C" not in sym_name or not snap.implied_volatility or not snap.latest_quote: continue
+                try:
+                    strike = float(sym_name.split("C")[1]) / 1000
+                    if abs(strike - self.spy_price) < 2:
+                        current_iv = float(snap.implied_volatility); break
+                except: continue
+            return max(0, min(100, (current_iv - 0.10) / 0.30 * 100))
+        except: return 50
+
+    def check_profit_target(self):
+        try:
+            positions = self.trading_client.get_all_positions()
+            actions = []
+            for pos in positions:
+                unrealized = float(pos.unrealized_pl)
+                cost_basis = float(pos.avg_entry_price) * abs(float(pos.qty)) * 100
+                if cost_basis > 0 and unrealized > 0:
+                    profit_pct = unrealized / cost_basis * 100
+                    if profit_pct >= 50:
+                        actions.append({"symbol": pos.symbol, "action": "CLOSE_50_PROFIT", "profit_pct": round(profit_pct, 1)})
+            return {"actions": actions}
+        except Exception as e: return {"error": str(e)}
+
+    def check_dte_exit(self):
+        try:
+            positions = self.trading_client.get_all_positions()
+            actions = []
+            today = datetime.utcnow().date()
+            for pos in positions:
+                if not any(c.isdigit() for c in pos.symbol): continue
+                try:
+                    dte = (datetime.strptime(f"20{pos.symbol[3:9]}", "%Y%m%d").date() - today).days
+                    if dte <= 21: actions.append({"symbol": pos.symbol, "action": "CLOSE_DTE_EXIT", "dte": dte})
+                except: continue
+            return {"actions": actions}
+        except Exception as e: return {"error": str(e)}
+
+    def select_strategy(self) -> dict:
+        filters = self.check_filters()
+        vix = filters["vix"]
+        day = self.get_day_of_week()
+        iv_rank = self.get_iv_rank()
+        if not filters["should_trade"]:
+            return {"action": "wait", "reason": f"Filters blocking: {', '.join(filters['blocking'])}"}
+        if day["is_wednesday"] and 13 <= vix["vix"] <= 18:
+            return {"action": "trade", "strategy": "iron_condor", "direction": "both", "reason": f"WED+VIX {vix['vix']:.0f}=98% WR"}
+        if day["is_friday"]:
+            return {"action": "wait", "reason": "Friday — avoid entries"}
+        if iv_rank > 50: return {"action": "trade", "strategy": "iron_condor", "direction": "both", "reason": f"IV Rank {iv_rank:.0f}%>50"}
+        regime = filters["regime"]
+        if "BEAR" in regime: return {"action": "trade", "strategy": "bear_call_spread", "direction": "call"}
+        if "BULL" in regime: return {"action": "trade", "strategy": "bull_put_spread", "direction": "put"}
+        return {"action": "trade", "strategy": "bull_put_spread", "direction": "put"}
 
 
 if __name__ == "__main__":
