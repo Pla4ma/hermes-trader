@@ -165,6 +165,29 @@ def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
     # Use optimal params if available
     opt_params = _load_optimal_params(best["symbol"])
 
+    # ═══════════════════════════════════════════════════════════════
+    # S-TIER RESEARCH: Vibe-Trading + TradingAgents BEFORE every trade
+    # ═══════════════════════════════════════════════════════════════
+    vibe_signal = _run_vibe_research(best["symbol"])
+    agents_signal = _run_tradingagents_research(best["symbol"])
+
+    result["vibe_signal"] = vibe_signal
+    result["agents_signal"] = agents_signal
+
+    # Both must agree (or at least not disagree strongly) to proceed
+    vibe_agrees = vibe_signal.get("signal", "neutral") != "bearish"
+    agents_agrees = agents_signal.get("signal", "neutral") != "bearish"
+
+    if not vibe_agrees and not agents_agrees:
+        result["action"] = "blocked"
+        result["reason"] = f"BOTH Vibe-Trading ({vibe_signal.get('signal')}) and TradingAgents ({agents_signal.get('signal')}) are BEARISH. Skipping {best['symbol']}."
+        return result
+
+    if not vibe_agrees or not agents_agrees:
+        # One disagrees — reduce sizing by 50%
+        notional *= 0.5
+        result["note"] = f"One research source disagrees — reducing size by 50% to ${notional:.2f}"
+
     # Execute trade
     try:
         order = api.submit_order(
@@ -211,6 +234,48 @@ def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
         logger.error(f"Auto-trade failed: {e}")
 
     return result
+
+
+def _run_vibe_research(symbol: str) -> dict:
+    """Run Vibe-Trading research on a symbol."""
+    try:
+        from .research.vibe_client import VibeTradingClient
+        vibe = VibeTradingClient()
+        result = vibe.run_market_regime_analysis(symbol)
+        output = result.get("output", "").lower()
+
+        signal = "neutral"
+        if "bullish" in output or "strong buy" in output or "upward" in output:
+            signal = "bullish"
+        elif "bearish" in output or "strong sell" in output or "downward" in output:
+            signal = "bearish"
+
+        return {
+            "source": "vibe_trading",
+            "signal": signal,
+            "status": result.get("status", "UNKNOWN"),
+            "summary": result.get("output", "")[:500],
+        }
+    except Exception as e:
+        return {"source": "vibe_trading", "signal": "neutral", "status": "ERROR", "error": str(e)}
+
+
+def _run_tradingagents_research(symbol: str) -> dict:
+    """Run TradingAgents multi-agent committee on a symbol."""
+    try:
+        from .research.agents_client import TradingAgentsClient
+        agents = TradingAgentsClient()
+        result = agents.get_committee_signal(symbol)
+
+        return {
+            "source": "trading_agents",
+            "signal": result.get("signal", "neutral"),
+            "confidence": result.get("confidence", 0),
+            "status": result.get("status", "UNKNOWN"),
+            "summary": result.get("decision", "")[:500],
+        }
+    except Exception as e:
+        return {"source": "trading_agents", "signal": "neutral", "status": "ERROR", "error": str(e)}
 
 
 def _load_optimal_params(symbol: str) -> dict:
