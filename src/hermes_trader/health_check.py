@@ -68,8 +68,9 @@ def health_check() -> dict:
     # 5. Tests
     try:
         import subprocess
+        venv_python = "/opt/hermes-trader/.venv/bin/python"
         result = subprocess.run(
-            ["python", "-m", "pytest", "tests/", "-q", "--tb=no"],
+            [venv_python, "-m", "pytest", "tests/", "-q", "--tb=no"],
             cwd="/opt/hermes-trader",
             capture_output=True, text=True, timeout=30,
         )
