@@ -139,15 +139,16 @@ class TradeCandidate(BaseModel):
 
 class CandidateScore(BaseModel):
     """Scores from the scoring system (Section 35)."""
-    evidence_score: int = Field(ge=0, le=25)
-    committee_score: int = Field(ge=0, le=25)
-    liquidity_score: int = Field(ge=0, le=20)
-    risk_score: int = Field(ge=0, le=20)
+    evidence_score: int = Field(ge=0, le=20)
+    committee_score: int = Field(ge=0, le=20)
+    liquidity_score: int = Field(ge=0, le=15)
+    risk_score: int = Field(ge=0, le=15)
     operational_score: int = Field(ge=0, le=10)
+    technical_score: int = Field(ge=0, le=20)
 
     @property
     def total(self) -> int:
-        return self.evidence_score + self.committee_score + self.liquidity_score + self.risk_score + self.operational_score
+        return self.evidence_score + self.committee_score + self.liquidity_score + self.risk_score + self.operational_score + self.technical_score
 
     @property
     def tier(self) -> str:

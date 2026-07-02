@@ -5,6 +5,7 @@ trade idea generation, and consensus scoring.
 """
 
 import logging
+import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,12 @@ class TradingAgentsClient:
 
     def __init__(self, agents_path: str = "/opt/vendor/TradingAgents"):
         self.agents_path = Path(agents_path)
+        # Ensure FREELLMAPI env vars are set for subprocess/sys.path import
+        import os
+        if "OPENAI_API_KEY" not in os.environ:
+            os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY", "")
+        if "OPENAI_BASE_URL" not in os.environ:
+            os.environ["OPENAI_BASE_URL"] = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:3001/v1")
 
     @property
     def available(self) -> bool:
@@ -41,7 +48,7 @@ class TradingAgentsClient:
         try:
             cmd = [
                 "python3", "-c",
-                f"import sys; sys.path.insert(0, '{self.agents_path}'); "
+                f"import os, sys; os.environ.update({{'OPENAI_API_KEY': os.getenv('OPENAI_API_KEY',''), 'OPENAI_BASE_URL': os.getenv('OPENAI_BASE_URL','http://127.0.0.1:3001/v1')}}); sys.path.insert(0, '{self.agents_path}'); "
                 f"from tradingagents.graph.trading_graph import TradingAgentsGraph; "
                 f"from tradingagents.default_config import DEFAULT_CONFIG; "
                 f"ta = TradingAgentsGraph(config=DEFAULT_CONFIG); "

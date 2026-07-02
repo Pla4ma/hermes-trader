@@ -42,8 +42,8 @@ def empty_risk():
     return RiskSnapshot(
         daily_pnl=0.0, weekly_pnl=0.0, monthly_pnl=0.0,
         consecutive_losses=0, trades_today=0, trades_this_week=0,
-        daily_loss_budget_remaining=1.5, weekly_loss_budget_remaining=3.0,
-        monthly_loss_budget_remaining=6.0,
+        daily_loss_budget_remaining=2.0, weekly_loss_budget_remaining=5.0,
+        monthly_loss_budget_remaining=10.0,
     )
 
 
@@ -135,7 +135,7 @@ class TestTradeCandidate:
 class TestPolicyEngine:
     def test_approves_valid_paper_candidate(self, fresh_account, empty_risk, fresh_market):
         c = make_basic_candidate()
-        score = CandidateScore(evidence_score=20, committee_score=20, liquidity_score=18, risk_score=15, operational_score=7)
+        score = CandidateScore(evidence_score=18, committee_score=18, liquidity_score=12, risk_score=12, operational_score=6, technical_score=10)
         result = policy_engine.evaluate(c, fresh_account, fresh_market, empty_risk, score)
         assert result.status == "APPROVED", f"Expected APPROVED but got {result.status}: {result.reasons}"
         assert result.allowed_action == "paper_order"

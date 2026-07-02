@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 
 from . import constants
 
-
 # Load .env once at module import
 _PROJECT_ROOT = Path("/opt/hermes-trader")
 _ENV_PATH = _PROJECT_ROOT / ".env"
@@ -102,7 +101,27 @@ class Config:
     max_new_trades_per_week = property(lambda s: int(_env_float("MAX_NEW_TRADES_PER_WEEK", constants.MAX_NEW_TRADES_PER_WEEK)))
     max_consecutive_losses = property(lambda s: int(_env_float("MAX_CONSECUTIVE_LOSSES", constants.MAX_CONSECUTIVE_LOSSES)))
     max_equity_order_notional_usd = property(lambda s: _env_float("MAX_EQUITY_ORDER_NOTIONAL_USD", constants.MAX_EQUITY_ORDER_NOTIONAL_USD))
-    max_position_notional_usd = property(lambda s: _env_float("MAX_POSITION_NOTIONAL_USD", constants.MAX_POSITION_NOTIONAL_USD))
+
+    # === Execution Advanced ===
+    initial_trade_notional = property(lambda s: float(_env_float("INITIAL_TRADE_NOTIONAL", 1000.0)))  # Aggressive: $1k
+    allow_pyramid_scaling = property(lambda s: _env_bool("ALLOW_PYRAMID_SCALING", True))           # Aggressive: allow pyramiding
+    
+    # === Position Management ===
+    trailing_stop_initial_pct = property(lambda s: float(_env_float("TRAILING_STOP_INITIAL_PCT", 0.02)))
+    trailing_stop_trail_pct = property(lambda s: float(_env_float("TRAILING_STOP_TRAIL_PCT", 0.01)))
+    trailing_stop_activation_pct = property(lambda s: float(_env_float("TRAILING_STOP_ACTIVATION_PCT", 0.03)))
+    
+    profit_taking_first_target_pct = property(lambda s: float(_env_float("PROFIT_TAKING_FIRST_TARGET_PCT", 0.05)))
+    profit_taking_first_take_pct = property(lambda s: float(_env_float("PROFIT_TAKING_FIRST_TAKE_PCT", 0.50)))
+    
+    # === Backtest Validation ===
+    require_backtest_validation = property(lambda s: _env_bool("REQUIRE_BACKTEST_VALIDATION", True))
+    backtest_min_sharpe = property(lambda s: float(_env_float("BACKTEST_MIN_SHARPE", 1.0)))
+    backtest_min_win_rate = property(lambda s: float(_env_float("BACKTEST_MIN_WIN_RATE", 50.0)))
+
+    # === Momentum Agent ===
+    spy_breakout_lookback_days = property(lambda s: int(_env_float("SPY_BREAKOUT_LOOKBACK_DAYS", 20)))
+    spy_breakout_trade_size = property(lambda s: float(_env_float("SPY_BREAKOUT_TRADE_SIZE", 2000.0)))  # Aggressive: $2k
 
     # === Assets ===
     allowed_underlyings = property(lambda s: _env_set("ALLOWED_UNDERLYINGS", constants.ALLOWED_UNDERLYINGS))
@@ -144,7 +163,14 @@ class Config:
     tradingagents_enabled = property(lambda s: _env_bool("TRADINGAGENTS_ENABLED", True))
     tradingagents_path = property(lambda s: Path(_env_str("TRADINGAGENTS_PATH", "/opt/TradingAgents")))
 
+    # === TradingAgents Configuration ====
+    tradingagents_deep_think_llm = property(lambda s: _env_str("TRADINGAGENTS_DEEP_THINK_LLM", ""))
+    tradingagents_quick_think_llm = property(lambda s: _env_str("TRADINGAGENTS_QUICK_THINK_LLM", ""))
+    tradingagents_max_debate_rounds = property(lambda s: int(_env_float("TRADINGAGENTS_MAX_DEBATE_ROUNDS", "3")))  # Aggressive: 3 rounds
+    tradingagents_max_risk_rounds = property(lambda s: int(_env_float("TRADINGAGENTS_MAX_RISK_ROUNDS", "3")))     # Aggressive: 3 rounds
+
     # === Execution ===
+    max_position_notional_usd = property(lambda s: _env_float("MAX_POSITION_NOTIONAL_USD", 5000.0))  # Aggressive: $5k limit
     require_market_open = property(lambda s: _env_bool("REQUIRE_MARKET_OPEN", constants.REQUIRE_MARKET_OPEN))
     allow_long_calls = property(lambda s: _env_bool("ALLOW_LONG_CALLS", constants.ALLOW_LONG_CALLS))
     allow_long_puts = property(lambda s: _env_bool("ALLOW_LONG_PUTS", constants.ALLOW_LONG_PUTS))

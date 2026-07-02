@@ -4,13 +4,15 @@ Invokes Vibe-Trading for market regime analysis, strategy research,
 and backtesting. All calls are wrapped in timeout and error handling.
 """
 
-import logging
+import os
+
 import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-logger = logging.getLogger("hermes_trader.research.vibe")
+import logging
+
 
 
 class VibeTradingClient:
@@ -40,6 +42,7 @@ class VibeTradingClient:
             r = subprocess.run(
                 cmd,
                 cwd=str(self.vibe_path / "agent"),
+                env={"LANGCHAIN_PROVIDER": "openai", "LANGCHAIN_MODEL_NAME": "auto", "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", ""), "OPENAI_BASE_URL": os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:3001/v1"), **os.environ},
                 capture_output=True,
                 text=True,
                 timeout=60,
