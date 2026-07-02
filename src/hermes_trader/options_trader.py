@@ -86,7 +86,7 @@ def scan_options(symbol: str = "SPY", direction: str = "bullish") -> list[dict]:
                 # Filters
                 if bid <= 0 or ask <= 0:
                     continue
-                if mid > MAX_OPTION_PREMIUM / 100:  # Per-share premium
+                if mid * 100 > MAX_OPTION_PREMIUM:  # Per-contract premium
                     continue
                 if delta < MIN_DELTA:
                     continue

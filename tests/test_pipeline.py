@@ -396,3 +396,129 @@ class TestEdgeCases:
     def test_order_request_validation(self):
         with pytest.raises(ValueError):
             OrderRequest(candidate_id="t", symbol="", side="buy", order_type="market", qty=-1)
+
+
+# ══════════════════════════════════════════════════════════════
+# Unit Tests — Options Engine v3 (Premium Seller)
+# ══════════════════════════════════════════════════════════════
+
+class TestPremiumSellerEngine:
+    """Test the premium-selling options engine (v3)."""
+
+    def test_instantiation(self):
+        from hermes_trader.options_v3 import PremiumSellerEngine
+        engine = PremiumSellerEngine()
+        assert engine is not None
+
+    def test_vix_data_structure(self):
+        """VIX data should have all required fields."""
+        from hermes_trader.options_v3 import PremiumSellerEngine
+        engine = PremiumSellerEngine()
+        vix = engine.vix_data
+        assert "vix" in vix
+        assert "vix3m" in vix
+        assert "term_ratio" in vix
+        assert "is_contango" in vix
+        assert "is_backwardation" in vix
+
+    def test_vix_contango_detection(self):
+        """Contango = VIX3M/VIX >= 1.05."""
+        from hermes_trader.options_v3 import PremiumSellerEngine
+        engine = PremiumSellerEngine()
+        vix = engine.vix_data
+        # Current VIX should be in contango (VIX3M > VIX)
+        if vix["vix3m"] > vix["vix"] * 1.05:
+            assert vix["is_contango"] is True
+            assert vix["is_backwardation"] is False
+
+    def test_filters_return_dict(self):
+        """Filters should return a dict with all fields."""
+        from hermes_trader.options_v3 import PremiumSellerEngine
+        engine = PremiumSellerEngine()
+        filters = engine.check_filters()
+        assert "should_trade" in filters
+        assert "filters" in filters
+        assert "blocking" in filters
+        assert "vix" in filters
+        assert "time" in filters
+        assert "regime" in filters
+
+    def test_credit_spread_requires_options(self):
+        """Credit spread should return a result (may be error if no cash)."""
+        from hermes_trader.options_v3 import PremiumSellerEngine
+        engine = PremiumSellerEngine()
+        spread = engine.find_credit_spread("put", width=2, target_delta=0.20, max_dte=1)
+        # Should have either a valid spread or an error
+        assert "short_leg" in spread or "error" in spread
+
+    def test_find_best_trade_returns_dict(self):
+        """find_best_trade should always return a dict."""
+        from hermes_trader.options_v3 import PremiumSellerEngine
+        engine = PremiumSellerEngine()
+        result = engine.find_best_trade()
+        assert isinstance(result, dict)
+        assert "action" in result
+
+    def test_min_credit_filter(self):
+        """Credit must be >= $0.20 or rejected."""
+        from hermes_trader.options_v3 import PremiumSellerEngine
+        engine = PremiumSellerEngine()
+        spread = engine.find_credit_spread("put", width=2, target_delta=0.20, max_dte=1)
+        if "credit" in spread and spread.get("credit", 0) > 0:
+            assert spread["credit"] >= 0.20, f"Credit {spread['credit']} below $0.20 minimum"
+
+    def test_iron_condor_structure(self):
+        """Iron condor should have both put and call spreads."""
+        from hermes_trader.options_v3 import PremiumSellerEngine
+        engine = PremiumSellerEngine()
+        result = engine.find_iron_condor(width=2, target_delta=0.20, max_dte=1)
+        if "error" not in result:
+            assert "put_spread" in result
+            assert "call_spread" in result
+            assert "total_credit" in result
+
+    def test_spy_price_real(self):
+        """SPY price should be a real number > 100."""
+        from hermes_trader.options_v3 import PremiumSellerEngine
+        engine = PremiumSellerEngine()
+        assert engine.spy_price > 100
+
+    def test_regime_detection(self):
+        """Regime should be one of the known values."""
+        from hermes_trader.options_v3 import PremiumSellerEngine
+        engine = PremiumSellerEngine()
+        regime = engine.get_regime()
+        valid = ["BULL_LOW_VOL", "BULL_HIGH_VOL", "BEAR_LOW_VOL", "BEAR_HIGH_VOL", "NEUTRAL", "UNKNOWN"]
+        assert regime in valid
+
+
+# ══════════════════════════════════════════════════════════════
+# Unit Tests — Market Regime
+# ══════════════════════════════════════════════════════════════
+
+class TestMarketRegime:
+    def test_detect_regime_structure(self):
+        from hermes_trader.market_regime import detect_regime
+        r = detect_regime()
+        assert "regime" in r
+        assert "aggression" in r
+        assert "sizing_multiplier" in r
+        assert "indicators" in r
+
+    def test_sizing_multiplier_range(self):
+        from hermes_trader.market_regime import detect_regime
+        r = detect_regime()
+        assert 0.25 <= r["sizing_multiplier"] <= 1.0
+
+
+# ══════════════════════════════════════════════════════════════
+# Unit Tests — Trailing Stops
+# ══════════════════════════════════════════════════════════════
+
+class TestTrailingStops:
+    def test_update_returns_dict(self):
+        from hermes_trader.trailing_stops import update_trailing_stops
+        result = update_trailing_stops()
+        assert "timestamp" in result
+        assert "positions_checked" in result
+        assert "actions" in result
