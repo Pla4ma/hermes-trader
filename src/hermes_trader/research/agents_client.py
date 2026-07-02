@@ -10,67 +10,85 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from ..config import config
-
-logger = logging.getLogger("hermes_trader.research.tradingagents")
+logger = logging.getLogger("hermes_trader.research.agents")
 
 
 class TradingAgentsClient:
-    """Wraps TradingAgents CLI for multi-agent analysis."""
+    """Wraps TradingAgents CLI for multi-agent debate analysis.
 
-    def __init__(self):
-        self.agents_path = Path(config.tradingagents_path)
+    TradingAgents entry point: tradingagents (from pyproject.toml)
+    Key command: python -c "from tradingagents...; ta.propagate('NVDA', '2024-05-10')"
+    """
+
+    def __init__(self, agents_path: str = "/opt/vendor/TradingAgents"):
+        self.agents_path = Path(agents_path)
 
     @property
     def available(self) -> bool:
-        return config.tradingagents_enabled and self.agents_path.exists()
+        return self.agents_path.exists()
 
-    def run_analysis(self, symbols: Optional[list[str]] = None) -> dict:
-        """Run TradingAgents multi-agent analysis and capture output.
+    def run_analysis(self, symbol: str, date: Optional[str] = None) -> dict:
+        """Run TradingAgents multi-agent analysis.
 
-        Phase 1: calls main.py or entry script, captures stdout.
-        Phase 1.5+: structured JSON output.
+        Returns structured output for scoring engine.
         """
         if not self.available:
-            return {"status": "SKIPPED", "reason": "TradingAgents not available"}
+            return {"status": "SKIPPED", "reason": "TradingAgents path not found"}
 
-        target = symbols or list(config.allowed_underlyings)
-        results = {}
-        for symbol in target:
-            try:
-                cmd = ["python3", "main.py", "--symbol", symbol, "--mode", "research"]
-                r = subprocess.run(cmd, cwd=self.agents_path, capture_output=True, text=True, timeout=120)
-                results[symbol] = {
-                    "stdout": r.stdout[-3000:],
-                    "stderr": r.stderr[-500:],
-                    "exit_code": r.returncode,
-                }
-            except subprocess.TimeoutExpired:
-                results[symbol] = {"error": "TIMEOUT", "stdout": "", "stderr": ""}
-            except FileNotFoundError:
-                return {"status": "ERROR", "reason": "TradingAgents entry point not found"}
-            except Exception as e:
-                results[symbol] = {"error": str(e)}
-
-        return {"status": "COMPLETED", "symbols": target, "results": results, "timestamp": datetime.utcnow().isoformat()}
-
-    def debate(self, symbol: str, direction: str = "bullish") -> dict:
-        """Run an agent debate on a specific symbol and direction."""
-        if not self.available:
-            return {"status": "SKIPPED", "reason": "TradingAgents not available"}
+        if date is None:
+            date = datetime.utcnow().strftime("%Y-%m-%d")
 
         try:
-            cmd = ["python3", "main.py", "--symbol", symbol, "--mode", "debate", "--direction", direction]
-            r = subprocess.run(cmd, cwd=self.agents_path, capture_output=True, text=True, timeout=180)
+            cmd = [
+                "python3", "-c",
+                f"import sys; sys.path.insert(0, '{self.agents_path}'); "
+                f"from tradingagents.graph.trading_graph import TradingAgentsGraph; "
+                f"from tradingagents.default_config import DEFAULT_CONFIG; "
+                f"ta = TradingAgentsGraph(config=DEFAULT_CONFIG); "
+                f"result = ta.propagate('{symbol}', '{date}'); "
+                f"print(result[1] if len(result) > 1 else result)"
+            ]
+            r = subprocess.run(
+                cmd,
+                cwd=str(self.agents_path),
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
             return {
                 "status": "COMPLETED",
                 "symbol": symbol,
-                "direction": direction,
-                "stdout": r.stdout[-3000:],
-                "stderr": r.stderr[-500:],
+                "date": date,
+                "decision": r.stdout[-2000:] if r.stdout else "",
+                "error": r.stderr[-500:] if r.stderr else "",
                 "exit_code": r.returncode,
+                "timestamp": datetime.utcnow().isoformat(),
             }
         except subprocess.TimeoutExpired:
-            return {"status": "TIMEOUT", "symbol": symbol, "direction": direction}
+            return {"status": "TIMEOUT", "symbol": symbol}
         except Exception as e:
             return {"status": "ERROR", "error": str(e)}
+
+    def get_committee_signal(self, symbol: str) -> dict:
+        """Return bullish/bearish/neutral + confidence."""
+        result = self.run_analysis(symbol)
+        if result["status"] != "COMPLETED":
+            return result
+
+        output = result.get("decision", "").lower()
+        if "bullish" in output:
+            signal = "bullish"
+        elif "bearish" in output:
+            signal = "bearish"
+        else:
+            signal = "neutral"
+
+        confidence = 0
+        if "strong" in output:
+            confidence = 85
+        elif "moderate" in output:
+            confidence = 65
+        elif "cautious" in output:
+            confidence = 45
+
+        return {**result, "signal": signal, "confidence": confidence}

@@ -22,6 +22,9 @@ from .models.order_request import OrderRequest
 from .policy.risk_gate import PolicyEngine, policy_engine
 from .policy.scoring import ScoringEngine
 from .integrations.alpaca_broker import PaperBrokerAdapter
+from .monitoring.position_monitor import PositionMonitor
+from .research.agents_client import TradingAgentsClient
+from .research.vibe_client import VibeTradingClient
 
 logger = logging.getLogger("hermes_trader.workflow")
 
@@ -33,7 +36,32 @@ class DailyWorkflow:
         self.broker = PaperBrokerAdapter()
         self.policy = policy_engine
         self.scoring = ScoringEngine()
+        self.vibe = VibeTradingClient()
+        self.agents = TradingAgentsClient()
+        self.positions = PositionMonitor()
         self._decision_log_path = config.project_root / "data" / "journals" / "decisions.jsonl"
+
+    def run_research_cycle(self, symbols: list[str] = None) -> dict:
+        """Run Vibe-Trading + TradingAgents research for given symbols."""
+        if symbols is None:
+            symbols = config.allowed_underlyings
+
+        research = {}
+
+        for symbol in symbols:
+            vibe_result = self.vibe.run_market_regime_analysis(symbol)
+            agents_result = self.agents.get_committee_signal(symbol)
+
+            research[symbol] = {
+                "underlying": symbol,
+                "symbol": symbol,
+                "vibe_summary": vibe_result.get("output", "")[-500:],
+                "agents_summary": agents_result.get("decision", "")[-500:],
+                "signal": agents_result.get("signal", "neutral"),
+                "confidence_score": agents_result.get("confidence", 0),
+            }
+
+        return {"status": "COMPLETED", "timestamp": datetime.utcnow().isoformat(), "research": research}
 
     def run(self, research_result: Optional[dict] = None) -> dict:
         """Run the full daily cycle.
