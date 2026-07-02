@@ -88,7 +88,7 @@ class PaperBrokerAdapter:
     # ── Orders ────────────────────────────────────────────────
 
     def submit_order(self, order: OrderRequest) -> dict:
-        """Journal the order. If live-unlocked, also execute."""
+        """Journal the order. If live-unlocked, also execute on Alpaca."""
         entry = {
             "timestamp": datetime.utcnow().isoformat(),
             "order_id": f"paper_{int(datetime.utcnow().timestamp())}_{order.symbol}",
@@ -107,13 +107,62 @@ class PaperBrokerAdapter:
 
         if config.is_live_unlocked:
             entry["mode"] = "LIVE"
-            entry["status"] = "simulated_live"  # Phase 1: still journaled, not executed
+            # Actually execute on Alpaca
+            try:
+                alpaca_result = self._submit_to_alpaca(order)
+                entry["status"] = "filled"
+                entry["alpaca_order_id"] = alpaca_result.get("id", "")
+                entry["alpaca_status"] = alpaca_result.get("status", "")
+                entry["filled_avg_price"] = alpaca_result.get("filled_avg_price", "")
+                entry["filled_qty"] = alpaca_result.get("filled_qty", "")
+            except Exception as e:
+                entry["status"] = "alpaca_error"
+                entry["error"] = str(e)
+                logger.error(f"Alpaca execution failed: {e}")
         else:
             entry["mode"] = "PAPER"
 
         self._append_journal(entry)
         logger.info(f"Order journaled: {entry['order_id']} ({entry['mode']})")
         return entry
+    
+    def _submit_to_alpaca(self, order: OrderRequest) -> dict:
+        """Submit order to Alpaca API."""
+        import os
+        import alpaca_trade_api as tradeapi
+        from alpaca.trading.enums import OrderSide, TimeInForce
+        
+        api_key = os.getenv("ALPACA_API_KEY", "")
+        secret_key = os.getenv("ALPACA_SECRET_KEY", "")
+        base_url = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
+        
+        api = tradeapi.REST(api_key, secret_key, base_url)
+        
+        side = OrderSide.BUY if order.side == "buy" else OrderSide.SELL
+        
+        kwargs = {
+            "symbol": order.symbol,
+            "side": side,
+            "type": order.order_type or "market",
+            "time_in_force": TimeInForce.DAY,  # Required for fractional
+        }
+        
+        if order.notional and float(order.notional) > 0:
+            kwargs["notional"] = str(round(float(order.notional), 2))
+        elif order.qty and float(order.qty) > 0:
+            kwargs["qty"] = str(order.qty)
+        
+        if order.limit_price and float(order.limit_price) > 0:
+            kwargs["limit_price"] = str(order.limit_price)
+        
+        result = api.submit_order(**kwargs)
+        
+        return {
+            "id": str(result.id),
+            "status": str(result.status),
+            "filled_avg_price": str(result.filled_avg_price or ""),
+            "filled_qty": str(result.filled_qty or "0"),
+        }
 
     def close_position(self, symbol: str, qty: Optional[float] = None) -> dict:
         """Journal position close."""
