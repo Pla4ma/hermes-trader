@@ -6,6 +6,7 @@ When an exit condition triggers, generates a close-order candidate.
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -21,8 +22,39 @@ class PositionMonitor:
         self.journal_path = Path(journal_path)
         self.positions_file = self.journal_path / "positions.json"
 
+    def get_alpaca_positions(self) -> list[dict]:
+        """Fetch live positions from Alpaca API."""
+        try:
+            import alpaca_trade_api as tradeapi
+            api_key = os.getenv("ALPACA_API_KEY", "")
+            secret_key = os.getenv("ALPACA_SECRET_KEY", "")
+            base_url = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
+            if not api_key or not secret_key:
+                return []
+            api = tradeapi.REST(api_key, secret_key, base_url)
+            positions = []
+            for p in api.list_positions():
+                positions.append({
+                    "symbol": p.symbol,
+                    "qty": float(p.qty),
+                    "entry_price": float(p.avg_entry_price),
+                    "current_price": float(p.current_price),
+                    "unrealized_pl": float(p.unrealized_pl),
+                    "unrealized_plpc": float(p.unrealized_plpc),
+                    "market_value": float(p.market_value),
+                })
+            return positions
+        except Exception as e:
+            logger.warning(f"Alpaca position fetch failed: {e}")
+            return []
+
     def get_open_positions(self) -> list[dict]:
-        """Load current open positions from journal."""
+        """Load current open positions from Alpaca or journal."""
+        # Prefer live Alpaca positions
+        alpaca_pos = self.get_alpaca_positions()
+        if alpaca_pos:
+            return alpaca_pos
+        # Fallback to local journal
         if not self.positions_file.exists():
             return []
         try:

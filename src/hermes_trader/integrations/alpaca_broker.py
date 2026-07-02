@@ -58,20 +58,32 @@ class PaperBrokerAdapter:
     # ── Market Data ───────────────────────────────────────────
 
     def get_market_snapshot(self, symbol: str) -> MarketSnapshot:
-        """Return simulated market data snapshot.
-
-        Phase 1: returns placeholder data. Real market data will
-        come from alpaca-py or an MCP server in the Phase 1.5 upgrade.
-        """
-        return MarketSnapshot(
-            timestamp=datetime.utcnow().isoformat(),
-            symbol=symbol,
-            last_price=0.0,
-            bid=0.0,
-            ask=0.0,
-            volume=0,
-            market_open=self._is_market_open(),
-        )
+        """Return market data snapshot from yfinance."""
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker(symbol)
+            info = ticker.fast_info
+            price = info.get("lastPrice", 0.0) or 0.0
+            bid = info.get("bid", 0.0) or 0.0
+            ask = info.get("ask", 0.0) or 0.0
+            volume = int(info.get("lastVolume", 0) or 0)
+            return MarketSnapshot(
+                timestamp=datetime.utcnow().isoformat(),
+                symbol=symbol,
+                last_price=round(price, 2),
+                bid=round(bid, 2),
+                ask=round(ask, 2),
+                volume=volume,
+                market_open=self._is_market_open(),
+            )
+        except Exception as e:
+            logger.warning(f"yfinance snapshot failed for {symbol}: {e}")
+            return MarketSnapshot(
+                timestamp=datetime.utcnow().isoformat(),
+                symbol=symbol,
+                last_price=0.0, bid=0.0, ask=0.0,
+                volume=0, market_open=self._is_market_open(),
+            )
 
     # ── Orders ────────────────────────────────────────────────
 
@@ -136,7 +148,7 @@ class PaperBrokerAdapter:
         today_str = now.strftime("%Y-%m-%d")
 
         for entry in self._log:
-            if entry.get("status") == "filled" or entry.get("status") == "simulated_live":
+            if entry.get("status") == "filled":
                 ts = datetime.fromisoformat(entry["timestamp"])
                 pnl = entry.get("filled_pnl", 0.0) or 0.0
 
@@ -148,9 +160,10 @@ class PaperBrokerAdapter:
                     else:
                         consecutive_losses = 0
 
-                # Week check
+                # Week check (Monday=0 start)
+                from datetime import timedelta
                 week_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-                week_start = week_start.replace(day=week_start.day - week_start.weekday())
+                week_start = week_start - timedelta(days=week_start.weekday())
                 if ts >= week_start:
                     trades_this_week += 1
                     weekly_pnl += pnl

@@ -42,7 +42,7 @@ class VibeTradingClient:
             r = subprocess.run(
                 cmd,
                 cwd=str(self.vibe_path / "agent"),
-                env={"LANGCHAIN_PROVIDER": "openai", "LANGCHAIN_MODEL_NAME": "auto", "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", ""), "OPENAI_BASE_URL": os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:3001/v1"), **os.environ},
+                env={"LANGCHAIN_PROVIDER": "openai", "LANGCHAIN_MODEL_NAME": "xiaomi/mimo-v2.5-pro", "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", ""), "OPENAI_BASE_URL": os.getenv("OPENAI_BASE_URL", "https://api.commandcode.ai/provider/v1"), **os.environ},
                 capture_output=True,
                 text=True,
                 timeout=60,

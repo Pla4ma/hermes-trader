@@ -71,6 +71,76 @@ class EnhancedDailyWorkflow:
         logger.info("Pre-Market Brief: %s", brief)
         return brief
     
+    def scan_watchlist(self, symbols: list[str] = None) -> list[dict]:
+        """Scan watchlist with confluence scoring and return ranked candidates."""
+        import numpy as np
+        try:
+            import yfinance as yf
+        except ImportError:
+            return []
+        
+        if symbols is None:
+            symbols = config.allowed_underlyings_list if hasattr(config, 'allowed_underlyings_list') else ['SPY','QQQ','AAPL','MSFT','NVDA','TSLA','META','GOOGL']
+        
+        results = []
+        for sym in symbols:
+            try:
+                data = yf.Ticker(sym).history(period='3mo')
+                if len(data) < 21: continue
+                close = data['Close']
+                high = data['High']
+                low = data['Low']
+                vol = data['Volume']
+                price = close.iloc[-1]
+                
+                ma20 = close.rolling(20).mean().iloc[-1]
+                ma50 = close.rolling(min(50, len(close))).mean().iloc[-1]
+                delta = close.diff()
+                gain = delta.clip(lower=0).rolling(14).mean()
+                loss = (-delta.clip(upper=0)).rolling(14).mean()
+                rsi = (100 - (100 / (1 + gain/loss))).iloc[-1]
+                ema12 = close.ewm(span=12).mean()
+                ema26 = close.ewm(span=26).mean()
+                macd_hist = (ema12 - ema26) - (ema12 - ema26).ewm(span=9).mean()
+                tr = np.maximum(high - low, np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
+                atr = tr.rolling(14).mean().iloc[-1]
+                ret5 = (close.iloc[-1] / close.iloc[-6] - 1) * 100
+                ret20 = (close.iloc[-1] / close.iloc[-21] - 1) * 100
+                vol_avg = vol.rolling(20).mean().iloc[-1]
+                vol_ratio = vol.iloc[-1] / vol_avg if vol_avg > 0 else 1
+                h20 = high.rolling(20).max().iloc[-1]
+                l20 = low.rolling(20).min().iloc[-1]
+                pos = (price - l20) / (h20 - l20) if h20 != l20 else 0.5
+                
+                score = 0
+                if price > ma20: score += 3
+                if ma20 > ma50: score += 2
+                if ret5 > 5: score += 5
+                elif ret5 > 2: score += 3
+                elif ret5 > 0: score += 1
+                if 40 < rsi < 60: score += 3
+                elif rsi < 35: score += 4
+                if macd_hist.iloc[-1] > 0: score += 3
+                elif macd_hist.iloc[-1] > macd_hist.iloc[-2]: score += 2
+                if vol_ratio > 1.5: score += 4
+                elif vol_ratio > 1.0: score += 2
+                if pos > 0.7: score += 3
+                elif pos > 0.4: score += 2
+                if ret20 > 5: score += 2
+                
+                results.append({
+                    'symbol': sym, 'price': round(price, 2), 'score': min(score, 30),
+                    'rsi': round(rsi, 1), 'ret5': round(ret5, 2), 'ret20': round(ret20, 2),
+                    'macd_hist': round(macd_hist.iloc[-1], 4), 'vol_ratio': round(vol_ratio, 2),
+                    'atr': round(atr, 2), 'ma20': round(ma20, 2), 'ma50': round(ma50, 2),
+                    'stop': round(price - 2 * atr, 2), 'target': round(price + 4 * atr, 2),
+                })
+            except Exception as e:
+                logger.warning(f"Scan failed for {sym}: {e}")
+        
+        results.sort(key=lambda x: x['score'], reverse=True)
+        return results
+    
     def run(self, research_result: Optional[dict] = None) -> dict:
         """Full daily cycle."""
         # Initialize session
@@ -286,7 +356,11 @@ class EnhancedDailyWorkflow:
         
         # Default quantity
         notional = research_result.get("order_notional", config.initial_trade_notional)
-        limit_price = research_result.get("limit_price", 0.0) 
+        limit_price = research_result.get("limit_price", 0.0)
+        # If no limit price from research, use current market price
+        if not limit_price or limit_price <= 0:
+            market_snap = self._get_market_snapshot(research_result.get("symbol", "SPY"))
+            limit_price = market_snap.last_price
         quantity = min(10.0, notional / max(limit_price, 0.01)) if limit_price > 0 else 0.0
         
         return {
@@ -317,35 +391,38 @@ class EnhancedDailyWorkflow:
         }
     
     def _get_market_snapshot(self, symbol: str = "SPY") -> MarketSnapshot:
-        """Get current market snapshot from broker."""
-        # In paper/live, implement Alpaca calls here
-        # For now, return mock snapshot
-        return MarketSnapshot(
-            timestamp=datetime.utcnow().isoformat() + "Z",
-            symbol=symbol,
-            last_price=440.0,
-            bid=439.95,
-            ask=440.05,
-            spread_pct=0.0227,
-            volume=50_000_000,
-            market_open=True
-        )
+        """Get current market snapshot from yfinance."""
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker(symbol)
+            info = ticker.fast_info
+            price = info.get("lastPrice", 0.0) or 0.0
+            bid = info.get("bid", 0.0) or 0.0
+            ask = info.get("ask", 0.0) or 0.0
+            volume = int(info.get("lastVolume", 0) or 0)
+            spread_pct = ((ask - bid) / ((ask + bid) / 2) * 100) if bid > 0 and ask > 0 else 0.0
+            return MarketSnapshot(
+                timestamp=datetime.utcnow().isoformat() + "Z",
+                symbol=symbol,
+                last_price=round(price, 2),
+                bid=round(bid, 2),
+                ask=round(ask, 2),
+                spread_pct=round(spread_pct, 4),
+                volume=volume,
+                market_open=self.broker._is_market_open()
+            )
+        except Exception as e:
+            logger.warning(f"yfinance snapshot failed for {symbol}: {e}")
+            return MarketSnapshot(
+                timestamp=datetime.utcnow().isoformat() + "Z",
+                symbol=symbol,
+                last_price=0.0, bid=0.0, ask=0.0,
+                spread_pct=0.0, volume=0, market_open=False
+            )
     
     def _get_risk_snapshot(self) -> RiskSnapshot:
-        """Get current risk snapshot from broker."""
-        # In paper/live, implement Alpaca calls here
-        # Return conservative defaults
-        return RiskSnapshot(
-            daily_pnl=0.0,
-            weekly_pnl=0.0,
-            monthly_pnl=0.0,
-            consecutive_losses=0,
-            trades_today=0,
-            trades_this_week=0,
-            daily_loss_budget_remaining=config.max_daily_loss_usd,
-            weekly_loss_budget_remaining=config.max_weekly_loss_usd,
-            monthly_loss_budget_remaining=config.max_monthly_loss_usd
-        )
+        """Get current risk snapshot from broker journal."""
+        return self.broker.get_risk_snapshot()
     
     def _format_report(self, report: dict, candidate: TradeCandidate) -> dict:
         """Final report formatting."""

@@ -41,6 +41,16 @@ class DailyWorkflow:
         self.positions = PositionMonitor()
         self._decision_log_path = config.project_root / "data" / "journals" / "decisions.jsonl"
 
+    def _fetch_market_price(self, symbol: str = "SPY") -> float:
+        """Fetch current market price via yfinance."""
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker(symbol)
+            price = ticker.fast_info.get("lastPrice", 0.0)
+            return round(price, 2) if price else 0.0
+        except Exception:
+            return 0.0
+
     def run_research_cycle(self, symbols: list[str] = None) -> dict:
         """Run Vibe-Trading + TradingAgents research for given symbols."""
         if symbols is None:
@@ -150,7 +160,7 @@ class DailyWorkflow:
                 order_type=research.get("order_type", "limit"),
                 quantity=research.get("order_qty", 0.0),
                 notional_usd=research.get("order_notional", 0.0),
-                limit_price=research.get("limit_price"),
+                limit_price=research.get("limit_price") or self._fetch_market_price(research.get("symbol", "SPY")),
             ),
             risk=RiskDetails(
                 max_loss_usd=research.get("max_loss", 0.0),

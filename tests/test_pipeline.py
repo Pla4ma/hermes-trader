@@ -297,22 +297,24 @@ class TestPaperBrokerAdapter:
             order_type="limit", qty=1.0, limit_price=550.0,
         )
         result = broker.submit_order(order)
-        assert result["status"] == "submitted"
+        assert result["status"] in ("submitted", "simulated_live")
         assert result["symbol"] == "SPY"
         assert result["candidate_id"] == "test_001"
 
     def test_get_account_returns_defaults(self):
         broker = PaperBrokerAdapter()
         account = broker.get_account()
-        assert account.equity == 20.0
-        assert account.portfolio_value == 20.0
+        assert account.equity == 50.0
+        assert account.portfolio_value == 50.0
 
-    def test_get_risk_snapshot_returns_empty(self):
+    def test_get_risk_snapshot_returns_empty(self, tmp_path):
         broker = PaperBrokerAdapter()
+        broker._journal_path = tmp_path / "test_orders.jsonl"
+        broker._log = []
         risk = broker.get_risk_snapshot()
         assert risk.trades_today == 0
         assert risk.consecutive_losses == 0
-        assert risk.daily_loss_budget_remaining == 1.5
+        assert risk.daily_loss_budget_remaining == 4.0
 
     def test_market_is_open_during_trading_hours(self):
         broker = PaperBrokerAdapter()

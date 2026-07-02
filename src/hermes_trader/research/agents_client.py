@@ -28,7 +28,7 @@ class TradingAgentsClient:
         if "OPENAI_API_KEY" not in os.environ:
             os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY", "")
         if "OPENAI_BASE_URL" not in os.environ:
-            os.environ["OPENAI_BASE_URL"] = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:3001/v1")
+            os.environ["OPENAI_BASE_URL"] = os.getenv("OPENAI_BASE_URL", "https://api.commandcode.ai/provider/v1")
 
     @property
     def available(self) -> bool:
@@ -48,7 +48,7 @@ class TradingAgentsClient:
         try:
             cmd = [
                 "python3", "-c",
-                f"import os, sys; os.environ.update({{'OPENAI_API_KEY': os.getenv('OPENAI_API_KEY',''), 'OPENAI_BASE_URL': os.getenv('OPENAI_BASE_URL','http://127.0.0.1:3001/v1')}}); sys.path.insert(0, '{self.agents_path}'); "
+                f"import os, sys; os.environ.update({{'OPENAI_API_KEY': os.getenv('OPENAI_API_KEY',''), 'OPENAI_BASE_URL': os.getenv('OPENAI_BASE_URL','https://api.commandcode.ai/provider/v1')}}); sys.path.insert(0, '{self.agents_path}'); "
                 f"from tradingagents.graph.trading_graph import TradingAgentsGraph; "
                 f"from tradingagents.default_config import DEFAULT_CONFIG; "
                 f"ta = TradingAgentsGraph(config=DEFAULT_CONFIG); "
