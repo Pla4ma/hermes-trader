@@ -117,12 +117,23 @@ def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
     acct = api.get_account()
     cash = float(acct.cash)
     held = {p.symbol for p in api.list_positions()}
-    orders = api.list_orders(status="open")
+
+    # Check market regime
+    try:
+        from .market_regime import detect_regime
+        regime = detect_regime()
+        regime_name = regime.get("regime", "UNKNOWN")
+        sizing_mult = regime.get("sizing_multiplier", 0.75)
+    except Exception:
+        regime_name = "UNKNOWN"
+        sizing_mult = 0.75
 
     result = {
         "timestamp": datetime.utcnow().isoformat(),
         "cash": cash,
         "held": list(held),
+        "regime": regime_name,
+        "sizing_multiplier": sizing_mult,
         "action": "none",
     }
 
