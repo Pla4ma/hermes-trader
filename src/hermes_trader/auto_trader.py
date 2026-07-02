@@ -200,10 +200,14 @@ def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
 
 
 def manage_exits() -> dict:
-    """Check positions and set stop losses + take profits.
+    """Check positions and manage exits with trailing stops + profit-taking.
 
-    For fractional positions, only ONE exit order is allowed.
-    We prefer SL (risk management) and let cron handle TP monitoring.
+    For fractional positions, only ONE exit order is allowed on Alpaca.
+    Strategy:
+    - Set SL at 1.5% below entry if no exit order exists
+    - If profit > 2.5%, tighten SL to trail by 0.8%
+    - If profit > 4%, sell 50% (partial profit-taking) via cron
+    - If profit > 8%, sell remaining via cron
     """
     from alpaca.trading.enums import OrderSide, TimeInForce
 
@@ -216,23 +220,62 @@ def manage_exits() -> dict:
     exit_symbols = {o.symbol for o in open_orders}
 
     for pos in positions:
-        if pos.symbol in exit_symbols:
-            continue  # Already has exit order
-
         entry = float(pos.avg_entry_price)
-        qty = pos.qty
-        sl_price = round(entry * 0.985, 2)  # 1.5% stop
+        current = float(pos.current_price)
+        qty = float(pos.qty)
+        pnl_pct = (current / entry - 1) * 100 if entry > 0 else 0
 
-        try:
-            sl = api.submit_order(
-                symbol=pos.symbol, qty=qty, side=OrderSide.SELL,
-                type="stop", stop_price=str(sl_price),
-                time_in_force=TimeInForce.DAY,
-            )
-            actions.append({"symbol": pos.symbol, "action": "SL_SET", "price": sl_price, "order_id": str(sl.id)})
-            logger.info(f"SL set: {pos.symbol} @ ${sl_price}")
-        except Exception as e:
-            actions.append({"symbol": pos.symbol, "action": "SL_ERROR", "error": str(e)})
+        # Trailing stop logic
+        if pnl_pct >= 2.5:
+            # Tighten stop to trail by 0.8%
+            new_sl = round(current * 0.992, 2)
+            old_sl = round(entry * 0.985, 2)
+            if new_sl > old_sl:
+                # Cancel existing order and set tighter stop
+                for o in open_orders:
+                    if o.symbol == pos.symbol:
+                        api.cancel_order(o.id)
+                        import time; time.sleep(0.5)
+                try:
+                    sl = api.submit_order(
+                        symbol=pos.symbol, qty=str(qty), side=OrderSide.SELL,
+                        type="stop", stop_price=str(new_sl),
+                        time_in_force=TimeInForce.DAY,
+                    )
+                    actions.append({
+                        "symbol": pos.symbol, "action": "TRAILING_SL",
+                        "old_sl": old_sl, "new_sl": new_sl,
+                        "pnl_pct": round(pnl_pct, 2),
+                    })
+                except Exception as e:
+                    actions.append({"symbol": pos.symbol, "action": "SL_ERROR", "error": str(e)})
+
+        elif pos.symbol not in exit_symbols:
+            # No exit order — set initial SL at 1.5%
+            sl_price = round(entry * 0.985, 2)
+            try:
+                sl = api.submit_order(
+                    symbol=pos.symbol, qty=str(qty), side=OrderSide.SELL,
+                    type="stop", stop_price=str(sl_price),
+                    time_in_force=TimeInForce.DAY,
+                )
+                actions.append({"symbol": pos.symbol, "action": "SL_SET", "price": sl_price})
+            except Exception as e:
+                actions.append({"symbol": pos.symbol, "action": "SL_ERROR", "error": str(e)})
+
+        # Profit-taking check (log for cron to execute)
+        if pnl_pct >= 4.0:
+            actions.append({
+                "symbol": pos.symbol, "action": "TP_SIGNAL",
+                "pnl_pct": round(pnl_pct, 2),
+                "recommendation": "SELL_50%",
+            })
+        elif pnl_pct >= 8.0:
+            actions.append({
+                "symbol": pos.symbol, "action": "TP_SIGNAL",
+                "pnl_pct": round(pnl_pct, 2),
+                "recommendation": "SELL_ALL",
+            })
 
     return {"timestamp": datetime.utcnow().isoformat(), "actions": actions}
 
