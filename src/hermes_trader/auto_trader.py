@@ -109,7 +109,7 @@ def scan_and_score(symbols: list[str] = None) -> list[dict]:
 def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
     """Scan, score, and execute the best trade if cash available.
 
-    Returns a dict with the trade result or reason for no trade.
+    Integrates: GEX, PCR, IV Rank, Kelly sizing, earnings check, VIX term structure.
     """
     from alpaca.trading.enums import OrderSide, TimeInForce
 
@@ -117,6 +117,29 @@ def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
     acct = api.get_account()
     cash = float(acct.cash)
     held = {p.symbol for p in api.list_positions()}
+
+    # ─── Options Analytics (institutional-grade) ───
+    analytics = {}
+    try:
+        from .options_analytics import OptionsAnalytics
+        oa = OptionsAnalytics()
+        analytics = oa.get_full_analytics("SPY")
+    except Exception:
+        pass
+
+    gex_regime = analytics.get("gex", {}).get("regime", "unknown")
+    pcr = analytics.get("put_call_ratio", {}).get("put_call_ratio", 1.0)
+    pcr_signal = analytics.get("put_call_ratio", {}).get("signal", "NEUTRAL")
+    max_pain = analytics.get("max_pain", {}).get("max_pain_strike", 0)
+
+    # ─── Earnings Check ───
+    try:
+        from .earnings_calendar import check_earnings
+        earnings = check_earnings("SPY")
+        if earnings.get("in_danger_zone"):
+            return {"action": "wait", "reason": "SPY earnings in danger zone", "analytics": analytics}
+    except Exception:
+        pass
 
     # Check market regime
     try:
