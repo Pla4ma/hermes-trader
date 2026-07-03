@@ -69,7 +69,7 @@ class TradingAgentsClient:
                 cwd=str(self.agents_path),
                 capture_output=True,
                 text=True,
-                timeout=180,
+                timeout=600,  # 10 minutes for TradingAgents (slow LLM calls)
                 env=sub_env,
             )
             return {
