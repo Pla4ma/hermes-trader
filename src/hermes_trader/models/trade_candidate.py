@@ -88,7 +88,7 @@ class TradeCandidate(BaseModel):
     asset_class: Literal["equity", "option"]
     underlying: str
     symbol: str
-    strategy: Literal["no_trade", "fractional_etf", "long_call", "long_put", "debit_spread_paper"]
+    strategy: Literal["no_trade", "fractional_etf", "long_call", "long_put", "debit_spread_paper", "debit_spread"]
     direction: Literal["bullish", "bearish", "neutral"]
     action: Literal["open", "close", "cancel", "no_trade"]
     order: OrderDetails = Field(default_factory=lambda: OrderDetails())
@@ -111,7 +111,7 @@ class TradeCandidate(BaseModel):
     @model_validator(mode="after")
     def validate_option_fields(self) -> TradeCandidate:
         """Option trades require option_details populated."""
-        if self.strategy in ("long_call", "long_put", "debit_spread_paper"):
+        if self.strategy in ("long_call", "long_put", "debit_spread_paper", "debit_spread"):
             if self.option_details.option_type is None:
                 raise ValueError(f"Option strategy '{self.strategy}' requires option_type (call/put)")
             if self.option_details.strike <= 0:

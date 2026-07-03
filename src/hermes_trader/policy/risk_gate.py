@@ -190,6 +190,10 @@ class PolicyEngine:
             if not (config.allow_long_calls if c.strategy == "long_call" else config.allow_long_puts if c.strategy == "long_put" else True):
                 self._reasons.append(f"STRATEGY_DISABLED: '{c.strategy}' not enabled in config.")
                 return False
+        if c.strategy in ("debit_spread",):
+            if not (config.allow_debit_spreads_live):
+                self._reasons.append(f"STRATEGY_DISABLED: '{c.strategy}' not enabled in config.")
+                return False
         return True
 
     def _check_account_limits(self, a: AccountSnapshot, c: TradeCandidate) -> bool:

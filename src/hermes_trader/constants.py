@@ -71,9 +71,10 @@ ALLOWED_STRATEGIES = {
     "long_call",
     "long_put",
     "debit_spread_paper",
+    "debit_spread",
 }
 LIVE_FORBIDDEN_STRATEGIES = {"debit_spread_paper"}  # Paper only in phase 1
-OPTION_STRATEGIES = {"long_call", "long_put", "debit_spread_paper"}
+OPTION_STRATEGIES = {"long_call", "long_put", "debit_spread_paper", "debit_spread"}
 
 # === Scoring Thresholds ===
 MIN_SCORE_PAPER = 65

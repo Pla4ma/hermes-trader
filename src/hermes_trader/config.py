@@ -174,6 +174,7 @@ class Config:
     require_market_open = property(lambda s: _env_bool("REQUIRE_MARKET_OPEN", constants.REQUIRE_MARKET_OPEN))
     allow_long_calls = property(lambda s: _env_bool("ALLOW_LONG_CALLS", constants.ALLOW_LONG_CALLS))
     allow_long_puts = property(lambda s: _env_bool("ALLOW_LONG_PUTS", constants.ALLOW_LONG_PUTS))
+    allow_debit_spreads_live = property(lambda s: _env_bool("ALLOW_DEBIT_SPREADS_LIVE", constants.ALLOW_DEBIT_SPREADS_LIVE))
 
     @property
     def is_kill_switch_active(self) -> bool:
