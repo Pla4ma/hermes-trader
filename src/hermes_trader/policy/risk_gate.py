@@ -210,6 +210,14 @@ class PolicyEngine:
         if a.cash < config.min_cash_reserve_usd:
             self._reasons.append(f"CASH_BELOW_RESERVE: ${a.cash:.2f} < ${config.min_cash_reserve_usd:.2f}")
             return False
+        # Multi-leg margin check: reject if required maintenance margin > buying power
+        if c.order_class == "mleg" and c.required_maintenance_margin is not None:
+            if c.required_maintenance_margin > a.buying_power:
+                self._reasons.append(
+                    f"MLEG_MARGIN_INSUFFICIENT: Required maintenance margin ${c.required_maintenance_margin:.2f} "
+                    f"> buying power ${a.buying_power:.2f}"
+                )
+                return False
         return True
 
     def _check_position_limits(self, a: AccountSnapshot, c: TradeCandidate) -> bool:

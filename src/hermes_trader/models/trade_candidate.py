@@ -89,6 +89,7 @@ class TradeCandidate(BaseModel):
     underlying: str
     symbol: str
     strategy: Literal["no_trade", "fractional_etf", "long_call", "long_put", "debit_spread_paper", "debit_spread"]
+    order_class: Literal["simple", "mleg"] = "simple"
     direction: Literal["bullish", "bearish", "neutral"]
     action: Literal["open", "close", "cancel", "no_trade"]
     order: OrderDetails = Field(default_factory=lambda: OrderDetails())
@@ -97,6 +98,7 @@ class TradeCandidate(BaseModel):
     evidence: EvidencePack = Field(default_factory=lambda: EvidencePack())
     exit_plan: ExitPlan = Field(default_factory=lambda: ExitPlan())
     confidence: ConfidenceInfo
+    required_maintenance_margin: Optional[float] = None
 
     @model_validator(mode="after")
     def validate_mode_action_consistency(self) -> TradeCandidate:

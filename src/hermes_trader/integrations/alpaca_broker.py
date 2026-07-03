@@ -103,13 +103,18 @@ class PaperBrokerAdapter:
             "take_profit": order.take_profit,
             "stop_loss": order.stop_loss,
             "candidate_id": order.candidate_id,
+            "legs": [leg.model_dump() for leg in order.legs] if order.legs else None,
+            "required_maintenance_margin": order.required_maintenance_margin,
         }
 
         if config.is_live_unlocked:
             entry["mode"] = "LIVE"
             # Actually execute on Alpaca
             try:
-                alpaca_result = self._submit_to_alpaca(order)
+                if order.order_class == "mleg":
+                    alpaca_result = self._submit_mleg_to_alpaca(order)
+                else:
+                    alpaca_result = self._submit_to_alpaca(order)
                 entry["status"] = "filled"
                 entry["alpaca_order_id"] = alpaca_result.get("id", "")
                 entry["alpaca_status"] = alpaca_result.get("status", "")
@@ -163,6 +168,70 @@ class PaperBrokerAdapter:
             "filled_avg_price": str(result.filled_avg_price or ""),
             "filled_qty": str(result.filled_qty or "0"),
         }
+
+    def _submit_mleg_to_alpaca(self, order: OrderRequest) -> dict:
+        """Submit a multi-leg (mleg) order to Alpaca API.
+
+        Alpaca mleg orders use order_class='mleg' with a legs array.
+        Each leg has: symbol, qty, side, positionIntent, and optional limit_price.
+        """
+        import os
+        from alpaca.trading.requests import OrderRequest as AlpacaMlegRequest, Leg
+        from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, PositionIntent
+        from alpaca.trading.client import TradingClient
+
+        api_key = os.getenv("ALPACA_API_KEY", "")
+        secret_key = os.getenv("ALPACA_SECRET_KEY", "")
+        base_url = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
+
+        client = TradingClient(api_key, secret_key, paper=config.alpaca_paper)
+
+        pi_map = {
+            "buy_to_open": PositionIntent.BUY_TO_OPEN,
+            "buy_to_close": PositionIntent.BUY_TO_CLOSE,
+            "sell_to_open": PositionIntent.SELL_TO_OPEN,
+            "sell_to_close": PositionIntent.SELL_TO_CLOSE,
+        }
+
+        alpaca_legs = []
+        for leg in order.legs:
+            leg_side = OrderSide.BUY if leg.side == "buy" else OrderSide.SELL
+            leg_kwargs = {
+                "symbol": leg.symbol,
+                "qty": str(leg.qty),
+                "side": leg_side,
+                "position_intent": pi_map[leg.position_intent],
+            }
+            if leg.limit_price is not None:
+                leg_kwargs["limit_price"] = str(leg.limit_price)
+            alpaca_legs.append(Leg(**leg_kwargs))
+
+        tif = TimeInForce.DAY
+        if order.limit_price and float(order.limit_price) > 0:
+            tif_order = client.submit_order(
+                AlpacaMlegRequest(
+                    order_class=OrderClass.MLEG,
+                    time_in_force=tif,
+                    legs=alpaca_legs,
+                    limit_price=str(order.limit_price),
+                )
+            )
+        else:
+            tif_order = client.submit_order(
+                AlpacaMlegRequest(
+                    order_class=OrderClass.MLEG,
+                    time_in_force=tif,
+                    legs=alpaca_legs,
+                )
+            )
+
+        return {
+            "id": str(tif_order.id),
+            "status": str(tif_order.status),
+            "filled_avg_price": str(tif_order.filled_avg_price or ""),
+            "filled_qty": str(tif_order.filled_qty or "0"),
+        }
+
 
     def close_position(self, symbol: str, qty: Optional[float] = None) -> dict:
         """Journal position close."""
