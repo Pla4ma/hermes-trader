@@ -44,3 +44,4 @@ build/
 Thumbs.db__pycache__/
 .venv/
 .pytest_cache/
+.venv312/

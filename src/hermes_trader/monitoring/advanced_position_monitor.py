@@ -52,10 +52,15 @@ class ProfitTakingConfig:
 
 @dataclass
 class TimeDecayConfig:
-    """Configuration for time-based position decay."""
-    max_hold_hours: int = 72  # 3 days max
+    """Configuration for time-based position decay.
+    
+    For 0DTE positions: use max_hold_hours=6 (must close same day).
+    For swing positions: default 72h (3 days) max.
+    """
+    max_hold_hours: int = 72  # 3 days max for swings; 6 for 0DTE
     decay_start_hours: int = 48  # Start decaying after 48 hours
     decay_rate_per_hour: float = 0.005  # 0.5% per hour after start
+    force_exit_time: str = "15:30"  # 3:30 PM ET — close all 0DTE before close
 
 
 @dataclass

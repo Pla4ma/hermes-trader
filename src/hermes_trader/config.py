@@ -138,6 +138,32 @@ class Config:
     min_open_interest = property(lambda s: int(_env_float("MIN_OPEN_INTEREST", constants.MIN_OPEN_INTEREST)))
     min_volume = property(lambda s: int(_env_float("MIN_VOLUME", constants.MIN_VOLUME)))
     max_bid_ask_spread_pct = property(lambda s: _env_float("MAX_BID_ASK_SPREAD_PCT", constants.MAX_BID_ASK_SPREAD_PCT))
+    allow_0dte = property(lambda s: _env_bool("ALLOW_0DTE", constants.ALLOW_0DTE))
+
+    # === 0DTE-Specific Risk Rules (PDT eliminated June 2026) ===
+    risk_per_trade_pct = property(lambda s: _env_float("RISK_PER_TRADE_PCT", constants.RISK_PER_TRADE_PCT))
+    max_0dte_trades_per_day = property(lambda s: int(_env_float("MAX_0DTE_TRADES_PER_DAY", constants.MAX_0DTE_TRADES_PER_DAY)))
+    max_0dte_position_size_pct = property(lambda s: _env_float("MAX_0DTE_POSITION_SIZE_PCT", constants.MAX_0DTE_POSITION_SIZE_PCT))
+    dte_entry_window_start = property(lambda s: _env_str("DTE_ENTRY_WINDOW_START", constants.DTE_ENTRY_WINDOW_START))
+    dte_entry_window_end = property(lambda s: _env_str("DTE_ENTRY_WINDOW_END", constants.DTE_ENTRY_WINDOW_END))
+    dte_force_exit_time = property(lambda s: _env_str("DTE_FORCE_EXIT_TIME", constants.DTE_FORCE_EXIT_TIME))
+    dte_profit_target_pct = property(lambda s: _env_float("DTE_PROFIT_TARGET_PCT", constants.DTE_PROFIT_TARGET_PCT))
+    dte_stop_loss_pct = property(lambda s: _env_float("DTE_STOP_LOSS_PCT", constants.DTE_STOP_LOSS_PCT))
+    dte_time_stop_minutes = property(lambda s: int(_env_float("DTE_TIME_STOP_MINUTES", constants.DTE_TIME_STOP_MINUTES)))
+    min_volume_0dte = property(lambda s: int(_env_float("MIN_VOLUME_0DTE", constants.MIN_VOLUME_0DTE)))
+    min_open_interest_0dte = property(lambda s: int(_env_float("MIN_OPEN_INTEREST_0DTE", constants.MIN_OPEN_INTEREST_0DTE)))
+    max_spread_pct_0dte = property(lambda s: _env_float("MAX_SPREAD_PCT_0DTE", constants.MAX_SPREAD_PCT_0DTE))
+
+    # === Small Account Phase Thresholds ===
+    small_account_phase_1_equity = property(lambda s: _env_float("SMALL_ACCOUNT_PHASE_1_EQUITY", constants.SMALL_ACCOUNT_PHASE_1_EQUITY))
+    small_account_phase_2_equity = property(lambda s: _env_float("SMALL_ACCOUNT_PHASE_2_EQUITY", constants.SMALL_ACCOUNT_PHASE_2_EQUITY))
+    small_account_phase_3_equity = property(lambda s: _env_float("SMALL_ACCOUNT_PHASE_3_EQUITY", constants.SMALL_ACCOUNT_PHASE_3_EQUITY))
+    phase_1_risk_per_trade_pct = property(lambda s: _env_float("PHASE_1_RISK_PER_TRADE_PCT", constants.PHASE_1_RISK_PER_TRADE_PCT))
+    phase_2_risk_per_trade_pct = property(lambda s: _env_float("PHASE_2_RISK_PER_TRADE_PCT", constants.PHASE_2_RISK_PER_TRADE_PCT))
+    phase_3_risk_per_trade_pct = property(lambda s: _env_float("PHASE_3_RISK_PER_TRADE_PCT", constants.PHASE_3_RISK_PER_TRADE_PCT))
+    phase_1_max_positions = property(lambda s: int(_env_float("PHASE_1_MAX_POSITIONS", constants.PHASE_1_MAX_POSITIONS)))
+    phase_2_max_positions = property(lambda s: int(_env_float("PHASE_2_MAX_POSITIONS", constants.PHASE_2_MAX_POSITIONS)))
+    phase_3_max_positions = property(lambda s: int(_env_float("PHASE_3_MAX_POSITIONS", constants.PHASE_3_MAX_POSITIONS)))
 
     # === Alpaca ===
     alpaca_api_key = property(lambda s: _env_str("ALPACA_API_KEY", ""))
@@ -221,7 +247,50 @@ class Config:
             "max_single_trade_loss_usd": self.max_single_trade_loss_usd,
             "max_daily_loss_usd": self.max_daily_loss_usd,
             "max_open_positions": self.max_open_positions,
+            # PDT eliminated June 2026 — 0DTE now allowed
+            "allow_0dte": self.allow_0dte,
+            "min_days_to_expiration": self.min_days_to_expiration,
+            "risk_per_trade_pct": self.risk_per_trade_pct,
+            "current_account_phase": self.current_account_phase,
         }
+
+    @property
+    def current_account_phase(self) -> int:
+        """Determine account growth phase based on current equity.
+        
+        Phase 1: $50 → $100 (preservation, 2% risk, 1-2 positions)
+        Phase 2: $100 → $500 (growth, 3% risk, 2-3 positions)
+        Phase 3: $500 → $2000 (scaling, 4% risk, 3-4 positions)
+        """
+        equity = self.max_account_equity_usd
+        if equity < self.small_account_phase_2_equity:
+            return 1
+        elif equity < self.small_account_phase_3_equity:
+            return 2
+        else:
+            return 3
+
+    @property
+    def current_phase_risk_pct(self) -> float:
+        """Return the risk-per-trade percentage for the current account phase."""
+        phase = self.current_account_phase
+        if phase == 1:
+            return self.phase_1_risk_per_trade_pct
+        elif phase == 2:
+            return self.phase_2_risk_per_trade_pct
+        else:
+            return self.phase_3_risk_per_trade_pct
+
+    @property
+    def current_phase_max_positions(self) -> int:
+        """Return the max positions allowed for the current account phase."""
+        phase = self.current_account_phase
+        if phase == 1:
+            return self.phase_1_max_positions
+        elif phase == 2:
+            return self.phase_2_max_positions
+        else:
+            return self.phase_3_max_positions
 
 
 # Singleton
