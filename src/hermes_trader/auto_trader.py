@@ -160,6 +160,76 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
 
     best = viable[0]
 
+    # ═══════════════════════════════════════════════════════════════
+    # ENTRY GATE FILTERS — BLOCKS bad entries (the #1 lesson)
+    # ═══════════════════════════════════════════════════════════════
+    try:
+        import yfinance as yf
+        from .entry_gates import check_all_gates
+        from datetime import datetime as dt, timezone, timedelta
+
+        sym = best.get("symbol", "SPY").split("/")[0] if "/" in best.get("symbol", "") else best.get("symbol", "SPY")
+        ticker = yf.Ticker(sym)
+        hist_today = ticker.history(period="1d")
+        hist_20d = ticker.history(period="20d")
+
+        if len(hist_today) > 0 and len(hist_20d) > 1:
+            today_data = hist_today.iloc[0]
+            open_price = float(today_data["Open"])
+            high_of_day = float(today_data["High"])
+            low_of_day = float(today_data["Low"])
+            current_volume = float(hist_today["Volume"].iloc[-1])
+            avg_volume = float(hist_20d["Volume"].mean())
+
+            # RSI calculation
+            close_20d = hist_20d["Close"]
+            delta = close_20d.diff()
+            gain = delta.clip(lower=0).rolling(14).mean()
+            loss = (-delta.clip(upper=0)).rolling(14).mean()
+            rs = gain / loss
+            rsi_series = 100 - (100 / (1 + rs))
+            rsi_14 = float(rsi_series.iloc[-1]) if len(rsi_series) > 0 and not rsi_series.iloc[-1] != rsi_series.iloc[-1] else 50.0
+
+            # Current time in ET
+            et_offset = timedelta(hours=-4)  # EDT
+            now_et = dt.now(timezone.utc) + et_offset
+
+            option_type = best.get("type", "call")
+
+            gates_passed, gate_failures = check_all_gates(
+                symbol=sym,
+                option_type=option_type,
+                spot=spot,
+                open_price=open_price,
+                high_of_day=high_of_day,
+                low_of_day=low_of_day,
+                current_volume=current_volume,
+                avg_volume_20d=avg_volume,
+                rsi_14=rsi_14,
+                now_et=now_et,
+            )
+
+            result["entry_gates"] = {
+                "passed": gates_passed,
+                "failures": gate_failures,
+                "open": round(open_price, 2),
+                "high": round(high_of_day, 2),
+                "low": round(low_of_day, 2),
+                "move_from_open": round(((spot - open_price) / open_price) * 100, 2) if open_price > 0 else 0,
+                "pullback_from_high": round(((high_of_day - spot) / high_of_day) * 100, 2) if high_of_day > 0 else 0,
+                "rsi_14": round(rsi_14, 1),
+                "vol_ratio": round(current_volume / avg_volume, 2) if avg_volume > 0 else 0,
+            }
+
+            if not gates_passed:
+                result["action"] = "blocked"
+                result["reason"] = f"ENTRY GATES BLOCKED: {'; '.join(gate_failures)}"
+                return result
+        else:
+            logger.warning("Insufficient intraday data for entry gates — proceeding with caution")
+    except Exception as e:
+        logger.warning(f"Entry gate check failed (proceeding): {e}")
+
     # ─── Position Sizing ───
     # 90% of account (max_notional=90 for $100 account)
     # For options: notional = cash * 90% * regime_sizing

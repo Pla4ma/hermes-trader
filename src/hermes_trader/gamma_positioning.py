@@ -90,8 +90,15 @@ class GammaPositioning:
                     iv = float(row.get("impliedVolatility", 0))
                     bid = float(row.get("bid", 0))
                     ask = float(row.get("ask", 0))
+                    last_price = float(row.get("lastPrice", 0))
+                    
+                    # Fallback: use lastPrice when bid/ask are 0 (common for 0DTE)
                     if bid <= 0 or ask <= 0:
-                        continue
+                        if last_price > 0:
+                            bid = last_price * 0.98  # Estimate 2% below last
+                            ask = last_price * 1.02  # Estimate 2% above last
+                        else:
+                            continue
 
                     strike = float(row["strike"])
                     option_type = "call" if is_call else "put"

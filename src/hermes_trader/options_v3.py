@@ -301,7 +301,11 @@ class PremiumSellerEngine:
             return selection
 
         strategy = selection["strategy"]
-        cash = selection["filters"]["cash"]
+        # Get cash from account instead of selection
+        from .integrations.robinhood_broker import RobinhoodBrokerAdapter
+        broker = RobinhoodBrokerAdapter()
+        account = broker.get_account()
+        cash = account.cash
 
         if strategy == "iron_condor":
             result = self.find_iron_condor(width=2, target_delta=0.20, max_dte=1)
