@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import config
+import yfinance as yf
 
 logger = logging.getLogger("hermes_trader.zero_dte_scanner")
 
