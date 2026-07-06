@@ -22,6 +22,40 @@ logger = logging.getLogger("hermes_trader.auto_trader")
 ACCOUNT_NUMBER = os.getenv("ROBINHOOD_ACCOUNT_NUMBER", "924058324")
 
 
+def _notify_trade(action: str, details: dict):
+    """Send notification about trade execution.
+    
+    This function logs the trade and can be extended to send
+    Telegram/email notifications in the future.
+    """
+    timestamp = datetime.utcnow().isoformat()
+    
+    # Log to file
+    notification = {
+        "timestamp": timestamp,
+        "action": action,
+        "details": details,
+    }
+    
+    notif_path = "/opt/hermes-trader/data/journals/trade_notifications.jsonl"
+    os.makedirs(os.path.dirname(notif_path), exist_ok=True)
+    with open(notif_path, "a") as f:
+        f.write(json.dumps(notification) + "\n")
+    
+    # Log to console
+    if action == "BUY_OPTION":
+        logger.info(
+            f"🔔 AUTO-TRADE: {details.get('symbol', '')} {details.get('option_type', '')} "
+            f"strike={details.get('strike', 0)} x{details.get('quantity', 0)} "
+            f"${details.get('total_cost', 0):.2f}"
+        )
+    elif action == "SELL_OPTION":
+        logger.info(
+            f"💰 AUTO-SELL: {details.get('symbol', '')} "
+            f"P&L: ${details.get('pnl', 0):.2f} ({details.get('pnl_pct', 0):.1f}%)"
+        )
+
+
 def _get_broker():
     """Get the Robinhood broker adapter instance."""
     from .integrations.robinhood_broker import RobinhoodBrokerAdapter
@@ -326,11 +360,14 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
     # For options: notional / (mid_price * 100) = number of contracts
     # Each contract costs mid_price * $100
     contract_cost = mid_price * 100
-    quantity = max(1, int(notional / contract_cost)) if contract_cost > 0 else 1
-
-    # Cap at what we can actually afford
-    max_affordable = int(cash / contract_cost) if contract_cost > 0 else 1
-    quantity = min(quantity, max_affordable)
+    # Use quantity from AggressiveSizer if available, otherwise calculate
+    if 'quantity' not in result or result.get("quantity", 0) < 1:
+        quantity = max(1, int(notional / contract_cost)) if contract_cost > 0 else 1
+        # Cap at what we can actually afford
+        max_affordable = int(cash / contract_cost) if contract_cost > 0 else 1
+        quantity = min(quantity, max_affordable)
+    else:
+        quantity = result["quantity"]
 
     if quantity < 1:
         result["reason"] = f"Cannot afford even 1 contract (cost=${contract_cost:.2f}, cash=${cash:.2f})"
@@ -399,6 +436,16 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
             f"strike={best.get('strike', 0)} x{quantity} "
             f"${contract_cost * quantity:.2f} score={best.get('score', 0)}/100 via Robinhood MCP"
         )
+        
+        # Send notification
+        _notify_trade("BUY_OPTION", {
+            "symbol": best.get("symbol", ""),
+            "option_type": best.get("type", ""),
+            "strike": best.get("strike", 0),
+            "quantity": quantity,
+            "total_cost": contract_cost * quantity,
+            "order_id": order.get("order_id", order.get("id", "")),
+        })
 
     except Exception as e:
         result["action"] = "error"
@@ -472,6 +519,8 @@ def manage_exits() -> dict:
     - If profit > 50%, tighten trail to 20%
     - If profit > 100%, sell 50%
     - If profit > 200%, sell remaining
+    
+    CRITICAL: Uses place_option_order for closing options, NOT place_equity_order.
     """
     broker = _get_broker()
     positions = broker.list_positions()
@@ -510,14 +559,19 @@ def manage_exits() -> dict:
                         except Exception:
                             pass
 
-                # Place new trailing stop order via Robinhood MCP
+                # Place new trailing stop order via Robinhood MCP (option order)
                 try:
-                    order = broker.place_equity_order(
-                        symbol=symbol,
+                    # Get the option_id from the position
+                    option_id = pos.get("option_id", "")
+                    if not option_id:
+                        actions.append({"symbol": symbol, "action": "SL_ERROR", "error": "No option_id in position"})
+                        continue
+                    
+                    order = broker.place_option_order(
+                        option_id=option_id,
                         side="sell",
-                        quantity=int(qty) if qty == int(qty) else None,
-                        notional=round(current * qty, 2) if qty != int(qty) else None,
-                        order_type="stop",
+                        quantity=max(1, int(qty)),
+                        limit_price=str(round(current, 4)),
                         time_in_force="day",
                     )
                     actions.append({
@@ -532,12 +586,15 @@ def manage_exits() -> dict:
         elif pnl_pct <= -50:
             # Hard stop-loss: close immediately at market
             try:
-                order = broker.place_equity_order(
-                    symbol=symbol,
+                option_id = pos.get("option_id", "")
+                if not option_id:
+                    actions.append({"symbol": symbol, "action": "SL_ERROR", "error": "No option_id in position"})
+                    continue
+                
+                order = broker.place_option_order(
+                    option_id=option_id,
                     side="sell",
-                    quantity=int(qty) if qty == int(qty) else None,
-                    notional=round(current * qty, 2) if qty != int(qty) else None,
-                    order_type="market",
+                    quantity=max(1, int(qty)),
                     time_in_force="day",
                 )
                 actions.append({
@@ -552,12 +609,16 @@ def manage_exits() -> dict:
             # No exit order — set initial stop at 50% loss
             sl_price = round(entry * 0.50, 4)
             try:
-                order = broker.place_equity_order(
-                    symbol=symbol,
+                option_id = pos.get("option_id", "")
+                if not option_id:
+                    actions.append({"symbol": symbol, "action": "SL_ERROR", "error": "No option_id in position"})
+                    continue
+                
+                order = broker.place_option_order(
+                    option_id=option_id,
                     side="sell",
-                    quantity=int(qty) if qty == int(qty) else None,
-                    notional=round(current * qty, 2) if qty != int(qty) else None,
-                    order_type="stop",
+                    quantity=max(1, int(qty)),
+                    limit_price=str(round(sl_price, 4)),
                     time_in_force="day",
                 )
                 actions.append({
@@ -575,11 +636,23 @@ def manage_exits() -> dict:
                 "pnl_pct": round(pnl_pct, 2),
                 "recommendation": "SELL_ALL",
             })
+            _notify_trade("SELL_OPTION", {
+                "symbol": symbol,
+                "pnl": round((current - entry) * qty, 2),
+                "pnl_pct": round(pnl_pct, 2),
+                "reason": "TP_200%",
+            })
         elif pnl_pct >= 100:
             actions.append({
                 "symbol": symbol, "action": "TP_SIGNAL",
                 "pnl_pct": round(pnl_pct, 2),
                 "recommendation": "SELL_50%",
+            })
+            _notify_trade("SELL_OPTION", {
+                "symbol": symbol,
+                "pnl": round((current - entry) * qty * 0.5, 2),
+                "pnl_pct": round(pnl_pct, 2),
+                "reason": "TP_100%",
             })
 
     return {"timestamp": datetime.utcnow().isoformat(), "actions": actions}

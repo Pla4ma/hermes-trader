@@ -109,14 +109,22 @@ class GammaPositioning:
                         except Exception:
                             gamma = 0.0
 
+                    def _safe_int(val, default=0):
+                        try:
+                            import math
+                            v = float(val) if val is not None else default
+                            return int(v) if not math.isnan(v) and not math.isinf(v) else default
+                        except (ValueError, TypeError):
+                            return default
+
                     chain.append({
                         "symbol": row.get("contractSymbol", ""),
                         "strike": strike,
                         "is_call": is_call,
                         "bid": bid,
                         "ask": ask,
-                        "volume": int(row.get("volume", 0) or 0),
-                        "open_interest": int(row.get("openInterest", 0) or 0),
+                        "volume": _safe_int(row.get("volume", 0)),
+                        "open_interest": _safe_int(row.get("openInterest", 0)),
                         "gamma": gamma,
                         "iv": iv,
                     })
