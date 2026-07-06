@@ -26,7 +26,7 @@ from hermes_trader.models.trade_candidate import (
 )
 from hermes_trader.models.position_snapshot import AccountSnapshot, MarketSnapshot, RiskSnapshot
 from hermes_trader.policy.risk_gate import policy_engine
-from hermes_trader.integrations.alpaca_broker import PaperBrokerAdapter
+from hermes_trader.integrations.robinhood_broker import PaperBrokerAdapter
 
 
 # ══════════════════════════════════════════════════════════════

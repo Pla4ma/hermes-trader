@@ -21,7 +21,7 @@ from hermes_trader.models.order_request import OrderRequest
 from hermes_trader.models.position_snapshot import AccountSnapshot, MarketSnapshot, RiskSnapshot, PositionSnapshot
 from hermes_trader.policy.risk_gate import PolicyEngine, policy_engine
 from hermes_trader.policy.scoring import ScoringEngine
-from hermes_trader.integrations.alpaca_broker import PaperBrokerAdapter
+from hermes_trader.integrations.robinhood_broker import PaperBrokerAdapter
 from hermes_trader.workflow import DailyWorkflow
 
 

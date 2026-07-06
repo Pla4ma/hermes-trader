@@ -169,6 +169,15 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
         from datetime import datetime as dt, timezone, timedelta
 
         sym = best.get("symbol", "SPY").split("/")[0] if "/" in best.get("symbol", "") else best.get("symbol", "SPY")
+        # Get spot price from candidate or yfinance
+        spot = best.get("underlying_price", 0) or 0
+        if spot <= 0:
+            spot = float(yf.Ticker(sym).fast_info.get("lastPrice", 0) or 0)
+        if spot <= 0:
+            logger.warning("Could not determine spot price — blocking trade")
+            result["action"] = "blocked"
+            result["reason"] = "Cannot determine spot price for entry gate check"
+            return result
         ticker = yf.Ticker(sym)
         hist_today = ticker.history(period="1d")
         hist_20d = ticker.history(period="20d")
@@ -188,11 +197,11 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
             loss = (-delta.clip(upper=0)).rolling(14).mean()
             rs = gain / loss
             rsi_series = 100 - (100 / (1 + rs))
-            rsi_14 = float(rsi_series.iloc[-1]) if len(rsi_series) > 0 and not rsi_series.iloc[-1] != rsi_series.iloc[-1] else 50.0
+            rsi_14 = float(rsi_series.iloc[-1]) if len(rsi_series) > 0 and rsi_series.iloc[-1] == rsi_series.iloc[-1] else 50.0
 
-            # Current time in ET
-            et_offset = timedelta(hours=-4)  # EDT
-            now_et = dt.now(timezone.utc) + et_offset
+            # Current time in ET (proper timezone)
+            from zoneinfo import ZoneInfo
+            now_et = dt.now(ZoneInfo("America/New_York"))
 
             option_type = best.get("type", "call")
 
@@ -228,7 +237,10 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
         else:
             logger.warning("Insufficient intraday data for entry gates — proceeding with caution")
     except Exception as e:
-        logger.warning(f"Entry gate check failed (proceeding): {e}")
+        logger.error(f"Entry gate check FAILED — blocking trade: {e}")
+        result["action"] = "blocked"
+        result["reason"] = f"Entry gate system error: {e}"
+        return result
 
     # ═══════════════════════════════════════════════════════════════
     # POSITION SIZING via AggressiveSizer (Kelly criterion)
@@ -295,30 +307,19 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
     result["vibe_signal"] = vibe_signal
     result["agents_signal"] = agents_signal
 
-    # Both must agree (or at least not disagree strongly) to proceed
-    vibe_agrees = vibe_signal.get("signal", "neutral") != "bearish"
-    agents_agrees = agents_signal.get("signal", "neutral") != "bearish"
+    # ── STRICT RESEARCH GATES ──
+    # Error/unknown/neutral are ALL treated as "not bullish" = BLOCK
+    vibe_signal_type = vibe_signal.get("signal", "unknown")
+    agents_signal_type = agents_signal.get("signal", "unknown")
 
-    # ── STRICT GATE: Both must have bullish/neutral signal ──
-    # If either is bearish OR both are neutral, BLOCK
-    vibe_is_bullish = vibe_signal.get("signal") == "bullish"
-    agents_is_bullish = agents_signal.get("signal") == "bullish"
+    # Only "bullish" is allowed — everything else blocks
+    vibe_is_bullish = vibe_signal_type == "bullish"
+    agents_is_bullish = agents_signal_type == "bullish"
 
-    if not vibe_agrees and not agents_agrees:
+    # If either source failed or returned bearish/unknown/neutral → BLOCK
+    if not vibe_is_bullish or not agents_is_bullish:
         result["action"] = "blocked"
-        result["reason"] = f"BOTH Vibe-Trading ({vibe_signal.get('signal')}) and TradingAgents ({agents_signal.get('signal')}) are BEARISH. Skipping {best.get('symbol', 'unknown')}."
-        return result
-
-    if not vibe_agrees or not agents_agrees:
-        # One disagrees — BLOCK entirely, don't just reduce size
-        result["action"] = "blocked"
-        result["reason"] = f"One research source is bearish (Vibe: {vibe_signal.get('signal')}, Agents: {agents_signal.get('signal')}). No trade."
-        return result
-
-    # Both neutral = no trade (need at least one bullish confirmation)
-    if not vibe_is_bullish and not agents_is_bullish:
-        result["action"] = "blocked"
-        result["reason"] = f"Both sources neutral (Vibe: {vibe_signal.get('signal')}, Agents: {agents_signal.get('signal')}). Need at least one BULLISH confirmation."
+        result["reason"] = f"Research gate BLOCKED — Vibe: {vibe_signal_type}, Agents: {agents_signal_type}. Both must be BULLISH."
         return result
 
     # ─── Calculate option quantity ───

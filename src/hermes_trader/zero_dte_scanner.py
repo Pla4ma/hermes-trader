@@ -250,8 +250,9 @@ def find_0dte_expiration(symbol: str) -> Optional[str]:
     except Exception as e:
         logger.warning(f"Chain lookup failed for {symbol}: {e}")
 
-    # Always try today's date — Robinhood supports 0DTE for SPY/QQQ
-    return today_str
+    # Don't blindly return today — return None if no chain found
+    logger.info(f"No 0DTE chain found for {symbol} on {today_str}")
+    return None
 
 
 # ── Greeks Estimation ─────────────────────────────────────────
@@ -383,7 +384,7 @@ def _score_delta(delta: float) -> float:
         return W_DELTA * max(0, abs_d / IDEAL_DELTA_LOW * 0.7)
     else:
         # Too ITM — expensive, less gamma leverage
-        return W_DELTA * max(0, 1.0 - (abs_d - IDEAL_DELTA_HIGH) * 2)
+        return W_DELTA * max(0, 0.7 - (abs_d - IDEAL_DELTA_HIGH) * 2)
 
 
 def _score_gamma(gamma: float) -> float:
@@ -511,16 +512,16 @@ def scan_0dte(
                         open_interest = _safe_int(
                             quote, "open_interest", "open_interest_count"
                         )
-                        iv = _safe_float(
-                            quote, "implied_volatility", "iv",
-                            "greeks.implied_volatility", default=0.0,
-                        )
-                        delta = _safe_float(
-                            quote, "delta", "greeks.delta", default=0.0,
-                        )
-                        gamma = _safe_float(
-                            quote, "gamma", "greeks.gamma", default=0.0,
-                        )
+                        # Extract IV from quote — handle nested greeks dict
+                        iv = _safe_float(quote, "implied_volatility", "iv", default=0.0)
+                        if iv == 0 and "greeks" in quote and isinstance(quote["greeks"], dict):
+                            iv = float(quote["greeks"].get("implied_volatility", 0) or 0)
+                        delta = _safe_float(quote, "delta", default=0.0)
+                        if delta == 0 and "greeks" in quote and isinstance(quote["greeks"], dict):
+                            delta = float(quote["greeks"].get("delta", 0) or 0)
+                        gamma = _safe_float(quote, "gamma", default=0.0)
+                        if gamma == 0 and "greeks" in quote and isinstance(quote["greeks"], dict):
+                            gamma = float(quote["greeks"].get("gamma", 0) or 0)
 
                         # If Greeks not provided, estimate from Black-Scholes
                         if (delta == 0 or gamma == 0) and spot > 0 and strike > 0:
@@ -541,6 +542,9 @@ def scan_0dte(
 
                         # Filter: max spread (use config threshold)
                         spread_pct = ((ask - bid) / mid * 100) if mid > 0 else 100
+                        # Block negative spread (stale/inverted quotes)
+                        if spread_pct < 0:
+                            spread_pct = 100  # Force max spread for inverted quotes
                         if spread_pct > config.max_spread_pct_0dte * 100:
                             continue
 
