@@ -230,16 +230,57 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
     except Exception as e:
         logger.warning(f"Entry gate check failed (proceeding): {e}")
 
-    # ─── Position Sizing ───
-    # 90% of account (max_notional=90 for $100 account)
-    # For options: notional = cash * 90% * regime_sizing
-    notional = min(cash * 0.90, max_notional) * sizing_mult
+    # ═══════════════════════════════════════════════════════════════
+    # POSITION SIZING via AggressiveSizer (Kelly criterion)
+    # ═══════════════════════════════════════════════════════════════
 
-    # If one research source disagrees, reduce by 50%
-    # (applied after research gates below)
+    # Calculate mid price first
+    mid_price = best.get("mid", 0)
+    if mid_price <= 0:
+        result["action"] = "error"
+        result["error"] = f"Invalid option price: {mid_price}"
+        return result
 
-    # Use optimal params if available
-    opt_params = _load_optimal_params(best.get("symbol", "SPY"))
+    try:
+        from .aggressive_sizer import AggressiveSizer
+        sizer = AggressiveSizer()
+
+        # Get consecutive losses from risk snapshot
+        consecutive_losses = 0
+        try:
+            risk_snap = broker.get_risk_snapshot()
+            consecutive_losses = risk_snap.consecutive_losses
+        except Exception:
+            pass
+
+        sizing_rec = sizer.recommend(
+            win_prob=0.55,  # Default win rate for 0DTE
+            avg_win=0.50,   # Target 50% avg win
+            avg_loss=0.50,  # Stop at 50% loss
+            premium_per_contract=mid_price,
+            account_value=cash,
+            consecutive_losses=consecutive_losses,
+        )
+
+        notional = sizing_rec.risk_dollars
+        quantity = sizing_rec.num_contracts
+
+        result["sizing"] = {
+            "method": "kelly_criterion",
+            "risk_dollars": round(notional, 2),
+            "num_contracts": quantity,
+            "kelly_fraction": round(sizing_rec.kelly_fraction, 4),
+            "adjusted_risk_pct": round(sizing_rec.adjusted_risk_pct, 4),
+            "signals": sizing_rec.signals,
+        }
+    except Exception as e:
+        # Fallback to simple sizing
+        logger.warning(f"AggressiveSizer failed, using fallback: {e}")
+        notional = min(cash * 0.90, max_notional) * sizing_mult
+        contract_cost = mid_price * 100
+        quantity = max(1, int(notional / contract_cost)) if contract_cost > 0 else 1
+        max_affordable = int(cash / contract_cost) if contract_cost > 0 else 1
+        quantity = min(quantity, max_affordable)
 
     # ═══════════════════════════════════════════════════════════════
     # S-TIER RESEARCH: Vibe-Trading + TradingAgents BEFORE every trade
@@ -258,24 +299,30 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
     vibe_agrees = vibe_signal.get("signal", "neutral") != "bearish"
     agents_agrees = agents_signal.get("signal", "neutral") != "bearish"
 
+    # ── STRICT GATE: Both must have bullish/neutral signal ──
+    # If either is bearish OR both are neutral, BLOCK
+    vibe_is_bullish = vibe_signal.get("signal") == "bullish"
+    agents_is_bullish = agents_signal.get("signal") == "bullish"
+
     if not vibe_agrees and not agents_agrees:
         result["action"] = "blocked"
         result["reason"] = f"BOTH Vibe-Trading ({vibe_signal.get('signal')}) and TradingAgents ({agents_signal.get('signal')}) are BEARISH. Skipping {best.get('symbol', 'unknown')}."
         return result
 
     if not vibe_agrees or not agents_agrees:
-        # One disagrees — reduce sizing by 50%
-        notional *= 0.5
-        result["note"] = f"One research source disagrees — reducing size by 50% to ${notional:.2f}"
+        # One disagrees — BLOCK entirely, don't just reduce size
+        result["action"] = "blocked"
+        result["reason"] = f"One research source is bearish (Vibe: {vibe_signal.get('signal')}, Agents: {agents_signal.get('signal')}). No trade."
+        return result
+
+    # Both neutral = no trade (need at least one bullish confirmation)
+    if not vibe_is_bullish and not agents_is_bullish:
+        result["action"] = "blocked"
+        result["reason"] = f"Both sources neutral (Vibe: {vibe_signal.get('signal')}, Agents: {agents_signal.get('signal')}). Need at least one BULLISH confirmation."
+        return result
 
     # ─── Calculate option quantity ───
     # For options: notional / (mid_price * 100) = number of contracts
-    mid_price = best.get("mid", 0)
-    if mid_price <= 0:
-        result["action"] = "error"
-        result["error"] = f"Invalid option price: {mid_price}"
-        return result
-
     # Each contract costs mid_price * $100
     contract_cost = mid_price * 100
     quantity = max(1, int(notional / contract_cost)) if contract_cost > 0 else 1

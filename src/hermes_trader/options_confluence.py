@@ -521,37 +521,57 @@ class ConfluenceScorer:
         pts = 0.0
         direction = tech.get("direction", "neutral")
 
+        # ── CRITICAL: Confirmation penalty ──
+        # Without confirmation, alignment means nothing
+        move_from_open = tech.get("move_from_open_pct", 0)
+        pullback_from_high = tech.get("pullback_from_high_pct", 0)
+        intraday_structure = tech.get("intraday_structure", "unknown")
+
+        # Must have pullback + bounce for calls (not chasing)
+        if c.option_type == "call":
+            if move_from_open > 0.3:
+                pts -= 5  # PENALTY: chasing green
+            if pullback_from_high < 0.1:
+                pts -= 5  # PENALTY: no pullback, buying top
+            if intraday_structure == "fading":
+                pts -= 8  # PENALTY: price below open
+        elif c.option_type == "put":
+            if move_from_open < -0.3:
+                pts -= 5  # PENALTY: chasing red
+            if intraday_structure == "recovering":
+                pts -= 8  # PENALTY: price above open
+
         # Alignment: does option type match technical direction?
         aligned = (
             (c.option_type == "call" and direction == "bullish") or
             (c.option_type == "put" and direction == "bearish")
         )
         if aligned:
-            pts += 10
+            pts += 8  # Reduced from 10
         elif direction == "neutral":
-            pts += 4  # neutral is okay for some strategies
+            pts += 2  # Reduced from 4
 
-        # Technical strength (scale 0-25 → 0-10 pts)
+        # Technical strength (scale 0-25 → 0-8 pts, reduced from 10)
         tech_score = tech.get("score", 0)
-        pts += min(10, tech_score * 0.4)
+        pts += min(8, tech_score * 0.32)
 
-        # Position in range bonus
+        # Position in range bonus (reduced)
         pir = tech.get("position_in_range", 0.5)
         if c.option_type == "call" and pir > 0.6:
-            pts += 2  # strong uptrend momentum
+            pts += 1  # Reduced from 2
         elif c.option_type == "put" and pir < 0.4:
-            pts += 2  # downtrend or overextended
+            pts += 1
         elif 0.3 < pir < 0.7:
-            pts += 1  # healthy range
+            pts += 0.5
 
-        # RSI context
+        # RSI context (reduced)
         rsi = tech.get("rsi", 50)
         if c.option_type == "call" and rsi < 40:
-            pts += 3  # oversold bounce potential
+            pts += 2  # Reduced from 3
         elif c.option_type == "put" and rsi > 65:
-            pts += 3  # overbought pullback potential
+            pts += 2
 
-        return min(25, pts)
+        return max(0, min(25, pts))
 
     # -- Dimension 2: IV Edge (25 pts) --
 
