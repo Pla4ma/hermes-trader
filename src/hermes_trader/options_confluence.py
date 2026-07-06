@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -825,31 +824,13 @@ class OptionsConfluenceScanner:
     """
     Institutional‑grade options scanner.
 
-    Pulls chain data from Alpaca, computes all 22 Greeks via hol_greeks,
+    Pulls chain data from yfinance, computes all 22 Greeks via hol_greeks,
     builds an IV surface, gathers gamma/positioning context, scores every
     candidate across 5 dimensions, and returns ranked results.
     """
 
     def __init__(self):
-        self.api_key = os.getenv("ALPACA_API_KEY", "")
-        self.secret_key = os.getenv("ALPACA_SECRET_KEY", "")
-        self.base_url = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
-        self._opt_client = None
-        self._trading_client = None
-
-    @property
-    def opt_client(self):
-        if self._opt_client is None:
-            from alpaca.data.historical import OptionHistoricalDataClient
-            self._opt_client = OptionHistoricalDataClient(self.api_key, self.secret_key)
-        return self._opt_client
-
-    @property
-    def trading_client(self):
-        if self._trading_client is None:
-            from alpaca.trading.client import TradingClient
-            self._trading_client = TradingClient(self.api_key, self.secret_key, paper=False)
-        return self._trading_client
+        self._spot_cache = {}
 
     # ---- data fetching ----
 
@@ -862,80 +843,72 @@ class OptionsConfluenceScanner:
         self, symbol: str, max_dte: int = DEFAULT_MAX_DTE,
     ) -> Tuple[List[dict], float]:
         """
-        Fetch option chain from Alpaca and normalise into list of dicts.
+        Fetch option chain from yfinance and normalise into list of dicts.
 
         Returns (chain_data, spot_price).
         """
-        from alpaca.data.requests import OptionChainRequest
+        import yfinance as yf
+        from datetime import date
+        from .greeks_engine import BlackScholesGreeks as BSG
 
-        today = datetime.utcnow().date()
-        max_expiry = today + timedelta(days=max_dte)
-
-        req = OptionChainRequest(
-            underlying_symbol=symbol,
-            expiration_date_gte=today + timedelta(days=1),
-            expiration_date_lte=max_expiry,
-        )
-        raw_chain = self.opt_client.get_option_chain(req)
+        ticker = yf.Ticker(symbol)
         spot = self._get_spot(symbol)
+        today = date.today()
+        r = RISK_FREE_RATE
 
         chain = []
-        for sym, snap in raw_chain.items():
-            if not snap.latest_quote or not snap.greeks:
-                continue
-
-            q = snap.latest_quote
-            bid = float(q.bid_price or 0)
-            ask = float(q.ask_price or 0)
-            if bid <= 0 or ask <= 0:
-                continue
-
-            mid = (bid + ask) / 2
-
-            # Parse symbol — format: YYYYMMDD00XXXXXCP (C or P then strike*1000)
-            is_call = "C" in sym
-            opt_type = "call" if is_call else "put"
+        for exp_str in ticker.options:
             try:
-                # Extract expiry date and strike from OCC symbol
-                # e.g., SPY250718C00530000
-                expiry_str = sym[len(symbol):len(symbol) + 6]
-                strike_raw = sym[len(symbol) + 7:]  # skip type char
-                strike = float(strike_raw) / 1000
-                exp_date = datetime.strptime(expiry_str, "%y%m%d").date()
-                dte = max(1, (exp_date - today).days)
-            except (ValueError, IndexError):
+                exp_date = date.fromisoformat(exp_str)
+                dte = (exp_date - today).days
+            except Exception:
+                continue
+            if dte > max_dte or dte < 1:
                 continue
 
-            # Get greeks from Alpaca snapshot
-            delta = abs(float(snap.greeks.delta or 0))
-            gamma = float(snap.greeks.gamma or 0)
-            theta = float(snap.greeks.theta or 0)
-            vega = float(snap.greeks.vega or 0)
-            iv = float(snap.implied_volatility or 0)
+            opt = ticker.option_chain(exp_str)
+            tau = max(dte, 1) / 365.0
 
-            volume = 0
-            if snap.latest_trade:
-                volume = int(snap.latest_trade.size or 0)
+            for side_df, is_call in [(opt.calls, True), (opt.puts, False)]:
+                for _, row in side_df.iterrows():
+                    iv = float(row.get("impliedVolatility", 0))
+                    bid = float(row.get("bid", 0))
+                    ask = float(row.get("ask", 0))
+                    if bid <= 0 or ask <= 0:
+                        continue
 
-            oi = 0  # OI often unavailable in snapshots
+                    mid = (bid + ask) / 2
+                    strike = float(row["strike"])
+                    volume = int(row.get("volume", 0) or 0)
+                    oi = int(row.get("openInterest", 0) or 0)
 
-            chain.append({
-                "symbol": sym,
-                "option_type": opt_type,
-                "strike": strike,
-                "bid": round(bid, 2),
-                "ask": round(ask, 2),
-                "mid": round(mid, 2),
-                "days_to_expiry": dte,
-                "expiry_date": exp_date.isoformat(),
-                "volume": volume,
-                "open_interest": oi,
-                "implied_volatility": iv,
-                "alpaca_delta": delta,
-                "alpaca_gamma": gamma,
-                "alpaca_theta": theta,
-                "alpaca_vega": vega,
-            })
+                    # Compute Greeks from IV using Black-Scholes
+                    opt_type = "call" if is_call else "put"
+                    try:
+                        delta = abs(float(BSG.delta(spot, strike, r, 0.0, iv, tau, opt_type)))
+                        gamma = float(BSG.gamma(spot, strike, r, 0.0, iv, tau))
+                        theta = float(BSG.theta(spot, strike, r, 0.0, iv, tau, opt_type))
+                        vega = float(BSG.vega(spot, strike, r, 0.0, iv, tau))
+                    except Exception:
+                        delta = gamma = theta = vega = 0.0
+
+                    chain.append({
+                        "symbol": row.get("contractSymbol", ""),
+                        "option_type": opt_type,
+                        "strike": strike,
+                        "bid": round(bid, 2),
+                        "ask": round(ask, 2),
+                        "mid": round(mid, 2),
+                        "days_to_expiry": dte,
+                        "expiry_date": exp_date.isoformat(),
+                        "volume": volume,
+                        "open_interest": oi,
+                        "implied_volatility": iv,
+                        "bsm_delta": delta,
+                        "bsm_gamma": gamma,
+                        "bsm_theta": theta,
+                        "bsm_vega": vega,
+                    })
 
         return chain, spot
 
@@ -1020,7 +993,7 @@ class OptionsConfluenceScanner:
             if spread > MAX_SPREAD_PCT:
                 continue
             # Delta check — need some directional exposure
-            if r["alpaca_delta"] < 0.05:
+            if r["bsm_delta"] < 0.05:
                 continue
             # Direction filter
             if auto_direction == "bullish" and r["option_type"] != "call":

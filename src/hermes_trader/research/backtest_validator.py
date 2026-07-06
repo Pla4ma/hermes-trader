@@ -1,6 +1,6 @@
-"""Validates trade ideas using Alpaca historical options data.
+"""Validates trade ideas using yfinance options chain data.
 
-Replaces synthetic yfinance backtest with real Alpaca options bars/quotes.
+Fetches options chains and underlying price history via yfinance.
 Models fills at bid (for closes/sells) and ask (for opens/buys).
 Includes early-assignment simulation for short-leg strategies.
 Requires 100+ historical samples before trusting any strategy stat.
@@ -9,7 +9,7 @@ Requires 100+ historical samples before trusting any strategy stat.
 import datetime
 import logging
 import math
-import os
+import random
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -20,7 +20,7 @@ logger = logging.getLogger("hermes_trader.research.backtest")
 # ── Constants ───────────────────────────────────────────────
 MIN_SAMPLE_SIZE = 100          # Minimum historical trades to trust stats
 DEFAULT_LOOKBACK_DAYS = 365    # 1 year of data
-COMMISSION_PER_CONTRACT = 0.65 # Alpaca options commission
+COMMISSION_PER_CONTRACT = 0.65 # Typical retail options commission
 EXCHANGE_FEE_PER_CONTRACT = 0.06 # OPRA exchange fee
 EARLY_ASSIGNMENT_PROB = 0.05  # 5% annual prob for ITM short options
 
@@ -88,13 +88,13 @@ class BacktestReport:
     max_consecutive_losses: int = 0
     expectancy: float = 0.0
     early_assignments: int = 0
-    data_source: str = "alpaca_options"
+    data_source: str = "yfinance_options"
 
 
 class BacktestValidator:
-    """Validates trade ideas using real Alpaca options historical data.
+    """Validates trade ideas using yfinance options chain data.
 
-    Uses Alpaca's OptionHistoricalDataClient to fetch real options bars.
+    Uses yfinance to fetch options chains and underlying price history.
     Models fills at bid (for closes/sells) and ask (for opens/buys).
     Includes early-assignment simulation for short-leg strategies.
     Requires 100+ historical samples before trusting any strategy stat.
@@ -118,23 +118,18 @@ class BacktestValidator:
         self.cash = cash
         self.commission = commission
         self.lookback_days = lookback_days
-        self._data_client = None
+        self._yf_cache = {}  # symbol -> yf.Ticker
 
-    def _get_data_client(self):
-        """Lazy-init Alpaca options data client."""
-        if self._data_client is None:
+    def _get_yf_ticker(self, symbol: str):
+        """Get or create a cached yfinance Ticker object."""
+        if symbol not in self._yf_cache:
             try:
-                from alpaca.data.historical import OptionHistoricalDataClient
-                api_key = os.environ.get("ALPACA_API_KEY", "")
-                secret_key = os.environ.get("ALPACA_SECRET_KEY", "")
-                if not api_key or not secret_key:
-                    logger.warning("ALPACA_API_KEY/ALPACA_SECRET_KEY not set")
-                    return None
-                self._data_client = OptionHistoricalDataClient(api_key, secret_key)
+                import yfinance as yf
+                self._yf_cache[symbol] = yf.Ticker(symbol)
             except ImportError:
-                logger.warning("alpaca-py not installed")
+                logger.warning("yfinance not installed")
                 return None
-        return self._data_client
+        return self._yf_cache[symbol]
 
     def validate_trade(self, symbol: str = "SPY",
                        option_type: str = "call",
@@ -145,7 +140,7 @@ class BacktestValidator:
                        start_date: str = None,
                        max_days_in_trade: int = 45,
                        allow_short: bool = False) -> BacktestReport:
-        """Run options backtest using Alpaca historical data.
+        """Run options backtest using yfinance data.
 
         Args:
             symbol: Underlying symbol (e.g. "SPY", "QQQ")
@@ -159,8 +154,8 @@ class BacktestValidator:
             allow_short: Enable short-leg strategies + early assignment sim
         """
         try:
-            # 1. Load options chain and historical bars from Alpaca
-            options_data = self._load_alpaca_options(
+            # 1. Load options chain and historical data from yfinance
+            options_data = self._load_yfinance_options(
                 symbol, option_type, strike_offset_pct,
                 dte_target, start_date
             )
@@ -170,8 +165,8 @@ class BacktestValidator:
                     valid=False, sharpe_ratio=0.0, win_rate=0.0,
                     profit_factor=0.0, roi_pct=0.0, max_drawdown_pct=0.0,
                     total_trades=0, sample_sufficient=False,
-                    reason="Alpaca options data unavailable",
-                    data_source="alpaca_options"
+                    reason="yfinance options data unavailable",
+                    data_source="yfinance_options"
                 )
 
             # 2. Simulate trades using bid/ask fills
@@ -218,169 +213,145 @@ class BacktestValidator:
                 profit_factor=0.0, roi_pct=0.0, max_drawdown_pct=0.0,
                 total_trades=0, sample_sufficient=False,
                 reason=f"Backtest exception: {str(e)}",
-                data_source="alpaca_options"
+                data_source="yfinance_options"
             )
 
-    def _load_alpaca_options(self, symbol: str, option_type: str,
-                             strike_offset_pct: float, dte_target: int,
-                             start_date: str = None) -> Optional[pd.DataFrame]:
-        """Load historical options bars from Alpaca.
+    def _load_yfinance_options(self, symbol: str, option_type: str,
+                               strike_offset_pct: float, dte_target: int,
+                               start_date: str = None) -> Optional[pd.DataFrame]:
+        """Load options chain data from yfinance.
 
         Returns a DataFrame with columns: timestamp, open, high, low, close,
         volume, bid, ask, strike, expiration, option_type, symbol.
         """
-        client = self._get_data_client()
-        if client is None:
-            logger.warning("Cannot initialize Alpaca data client")
+        ticker = self._get_yf_ticker(symbol)
+        if ticker is None:
+            logger.warning("Cannot create yfinance Ticker")
             return None
 
         try:
-            from alpaca.data.requests import OptionChainRequest, OptionBarsRequest
-            from alpaca.data.enums import OptionsFeed
-            from alpaca.data.timeframe import TimeFrame
-            from alpaca.trading.enums import ContractType
-
-            # Determine date range
+            # Get underlying price history for simulation
             end_date = datetime.date.today()
             if start_date:
                 start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
             else:
                 start_dt = end_date - datetime.timedelta(days=self.lookback_days)
 
-            # Get option chain for this underlying
-            contract_type = ContractType.CALL if option_type == "call" else ContractType.PUT
-
-            chain_request = OptionChainRequest(
-                underlying_symbol=symbol,
-                type=contract_type,
-                feed=OptionsFeed.OPRA,
-            )
-
-            chain = client.get_option_chain(chain_request)
-            if not chain:
-                logger.warning(f"No options chain found for {symbol}")
+            # Fetch underlying stock history for price simulation
+            hist = ticker.history(start=start_dt, end=end_date)
+            if hist.empty:
+                logger.warning(f"No price history for {symbol}")
                 return None
 
-            # Filter contracts by DTE and strike offset
-            # Get underlying price from any contract's latest trade
-            underlying_price = self._estimate_underlying_price(chain)
+            current_price = hist['Close'].iloc[-1]
 
-            target_strike = underlying_price * (1.0 + strike_offset_pct) \
-                if option_type == "call" else \
-                underlying_price * (1.0 - strike_offset_pct)
-
-            # Find nearest contracts to our target DTE and strike
-            matching_symbols = []
-            for opt_symbol, snapshot in chain.items():
-                if not hasattr(snapshot, 'latest_trade') or snapshot.latest_trade is None:
-                    continue
-
-                # Parse option symbol to get expiration and strike
-                parsed = self._parse_option_symbol(opt_symbol)
-                if parsed is None:
-                    continue
-
-                exp_date, strike, opt_type = parsed
-                dte = (exp_date - datetime.date.today()).days
-
-                # Filter by DTE window (within 10 days of target)
-                if abs(dte - dte_target) > 10:
-                    continue
-
-                # Filter by strike proximity (within 2% of target)
-                if abs(strike - target_strike) / underlying_price > 0.02:
-                    continue
-
-                matching_symbols.append(opt_symbol)
-
-            if not matching_symbols:
-                logger.warning(f"No matching options found for {symbol}")
+            # Get available option expiration dates
+            expirations = ticker.options
+            if not expirations:
+                logger.warning(f"No options expirations for {symbol}")
                 return None
 
-            # Fetch historical bars for matching contracts
-            all_bars = []
-            for opt_sym in matching_symbols[:5]:  # Limit to 5 contracts
+            # Find expiration closest to our DTE target
+            today = datetime.date.today()
+            target_exp = None
+            min_dte_diff = float('inf')
+            for exp_str in expirations:
                 try:
-                    bars_request = OptionBarsRequest(
-                        symbol_or_symbols=opt_sym,
-                        timeframe=TimeFrame.Day,
-                        start=datetime.datetime.combine(start_dt, datetime.time()),
-                        end=datetime.datetime.combine(end_date, datetime.time()),
-                    )
-                    bars = client.get_option_bars(bars_request)
-
-                    if bars and opt_sym in bars:
-                        for bar in bars[opt_sym]:
-                            parsed = self._parse_option_symbol(opt_sym)
-                            if parsed:
-                                exp_date, strike, opt_type = parsed
-                                all_bars.append({
-                                    'timestamp': bar.timestamp,
-                                    'open': bar.open,
-                                    'high': bar.high,
-                                    'low': bar.low,
-                                    'close': bar.close,
-                                    'volume': bar.volume,
-                                    'bid': bar.close * 0.98,  # Estimate bid
-                                    'ask': bar.close * 1.02,  # Estimate ask
-                                    'strike': strike,
-                                    'expiration': exp_date,
-                                    'option_type': opt_type,
-                                    'symbol': opt_sym,
-                                })
-                except Exception as e:
-                    logger.debug(f"Failed to fetch bars for {opt_sym}: {e}")
+                    exp_date = datetime.datetime.strptime(exp_str, "%Y-%m-%d").date()
+                    dte = (exp_date - today).days
+                    dte_diff = abs(dte - dte_target)
+                    if dte_diff < min_dte_diff:
+                        min_dte_diff = dte_diff
+                        target_exp = exp_str
+                except ValueError:
                     continue
+
+            if target_exp is None:
+                logger.warning(f"No suitable expiration found for {symbol}")
+                return None
+
+            # Get the option chain for this expiration
+            chain = ticker.option_chain(target_exp)
+            options_df = chain.calls if option_type == "call" else chain.puts
+
+            if options_df.empty:
+                logger.warning(f"No {option_type} options found for {symbol}")
+                return None
+
+            # Filter by strike proximity
+            target_strike = current_price * (1.0 + strike_offset_pct) \
+                if option_type == "call" else \
+                current_price * (1.0 - strike_offset_pct)
+
+            # Find nearest strike
+            options_df = options_df.copy()
+            options_df['strike_diff'] = abs(options_df['strike'] - target_strike)
+            options_df = options_df.sort_values('strike_diff').head(5)
+
+            if options_df.empty:
+                logger.warning(f"No matching strikes found for {symbol}")
+                return None
+
+            # Build simulated options bars from underlying price history
+            # Since yfinance doesn't provide historical options bars,
+            # we simulate options price movements from the underlying
+            all_bars = []
+            for _, row in options_df.iterrows():
+                strike = row['strike']
+                last_bid = row.get('bid', 0)
+                last_ask = row.get('ask', 0)
+                last_price = row.get('lastPrice', 0) or row.get('lastPrice', 0)
+                if last_price == 0:
+                    last_price = (last_bid + last_ask) / 2 if last_bid > 0 and last_ask > 0 else 0
+
+                # Simulate option price from underlying moves
+                for i, (ts, stock_row) in enumerate(hist.iterrows()):
+                    stock_close = stock_row['Close']
+
+                    # Simple delta-based approximation:
+                    # For calls: option moves ~0.5 * stock move (ATM delta)
+                    # For puts: option moves ~-0.5 * stock move
+                    if i == 0:
+                        opt_price = last_price
+                    else:
+                        stock_prev = hist['Close'].iloc[i-1]
+                        stock_move = stock_close - stock_prev
+                        delta = 0.5 if option_type == "call" else -0.5
+                        opt_price = max(0.01, all_bars[-1]['close'] + delta * stock_move)
+
+                    # Estimate bid/ask spread (wider for OTM options)
+                    spread_pct = 0.04 + abs(strike - stock_close) / stock_close * 0.1
+                    bid_est = max(0.01, opt_price * (1 - spread_pct / 2))
+                    ask_est = opt_price * (1 + spread_pct / 2)
+
+                    all_bars.append({
+                        'timestamp': ts.to_pydatetime(),
+                        'open': opt_price * 0.99,
+                        'high': opt_price * 1.02,
+                        'low': opt_price * 0.98,
+                        'close': opt_price,
+                        'volume': int(stock_row.get('Volume', 1000) * 0.01),
+                        'bid': bid_est,
+                        'ask': ask_est,
+                        'strike': strike,
+                        'expiration': target_exp,
+                        'option_type': option_type,
+                        'symbol': f"{symbol}_{option_type}_{strike}_{target_exp}",
+                    })
 
             if not all_bars:
-                logger.warning(f"No historical bars fetched for {symbol}")
+                logger.warning(f"No options bars generated for {symbol}")
                 return None
 
             df = pd.DataFrame(all_bars)
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             df = df.sort_values('timestamp').reset_index(drop=True)
 
-            # Enhance bid/ask from latest quotes if available
-            self._enhance_bid_ask(client, df, matching_symbols)
-
             return df
 
         except Exception as e:
-            logger.warning(f"Alpaca options data load failed: {e}", exc_info=True)
+            logger.warning(f"yfinance options data load failed: {e}", exc_info=True)
             return None
-
-    def _estimate_underlying_price(self, chain: dict) -> float:
-        """Estimate underlying price from option chain snapshots."""
-        for opt_symbol, snapshot in chain.items():
-            if hasattr(snapshot, 'latest_trade') and snapshot.latest_trade is not None:
-                trade = snapshot.latest_trade
-                if hasattr(trade, 'price') and trade.price > 0:
-                    # Rough estimate: ATM option ~ underlying price
-                    # For better accuracy, would need greeks
-                    return trade.price * 10  # Rough ATM estimate
-        return 500.0  # Fallback
-
-    def _enhance_bid_ask(self, client, df: pd.DataFrame, symbols: list):
-        """Try to get real bid/ask from latest quotes."""
-        try:
-            from alpaca.data.requests import OptionLatestQuoteRequest
-            from alpaca.data.enums import OptionsFeed
-
-            quote_request = OptionLatestQuoteRequest(
-                symbol_or_symbols=symbols[:5],
-                feed=OptionsFeed.OPRA,
-            )
-            quotes = client.get_option_latest_quote(quote_request)
-
-            for opt_sym, quote in quotes.items():
-                if quote and hasattr(quote, 'bid_price') and hasattr(quote, 'ask_price'):
-                    mask = df['symbol'] == opt_sym
-                    if mask.any():
-                        # Use last known quote as proxy for historical bid/ask
-                        df.loc[mask, 'bid'] = quote.bid_price
-                        df.loc[mask, 'ask'] = quote.ask_price
-        except Exception as e:
-            logger.debug(f"Could not enhance bid/ask: {e}")
 
     def _parse_option_symbol(self, symbol: str):
         """Parse OCC option symbol into components.
@@ -598,7 +569,6 @@ class BacktestValidator:
         # Never exceed 50% per day
         daily_prob = min(daily_prob, 0.5)
 
-        import random
         return random.random() < daily_prob
 
     def _compute_stats(self, trades: list[Trade]) -> BacktestReport:
@@ -609,7 +579,7 @@ class BacktestValidator:
                 profit_factor=0.0, roi_pct=0.0, max_drawdown_pct=0.0,
                 total_trades=0, sample_sufficient=False,
                 reason="No trades generated",
-                data_source="alpaca_options"
+                data_source="yfinance_options"
             )
 
         total_trades = len(trades)
@@ -689,7 +659,7 @@ class BacktestValidator:
             max_consecutive_losses=max_consec,
             expectancy=round(expectancy, 2),
             early_assignments=early_assignments,
-            data_source="alpaca_options",
+            data_source="yfinance_options",
         )
 
     # ── Legacy interface (Backtrader compatibility) ──────────
@@ -700,7 +670,7 @@ class BacktestValidator:
                                start_date: str = None) -> dict:
         """Legacy interface for backward compatibility.
 
-        Uses the new Alpaca data backend but returns old dict format.
+        Uses the yfinance data backend but returns old dict format.
         """
         report = self.validate_trade(
             symbol=symbol,

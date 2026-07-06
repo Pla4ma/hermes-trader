@@ -4,6 +4,14 @@ import json
 import os
 from datetime import datetime
 
+from .integrations.robinhood_broker import (
+    ROBINHOOD_ACCOUNT,
+    _parse_orders_list,
+    _parse_positions,
+    _safe_float,
+    robinhood_mcp_call,
+)
+
 
 def rebalance() -> dict:
     """Check positions and rebalance based on optimal parameters.
@@ -14,15 +22,19 @@ def rebalance() -> dict:
     - If cash is available, buy the next best candidate
     """
     try:
-        import alpaca_trade_api as tradeapi
-        api_key = os.getenv("ALPACA_API_KEY", "")
-        secret_key = os.getenv("ALPACA_SECRET_KEY", "")
-        base_url = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
-        api = tradeapi.REST(api_key, secret_key, base_url)
+        account_data = robinhood_mcp_call("get_accounts", {})
+        positions_data = robinhood_mcp_call("get_equity_positions", {
+            "account_number": ROBINHOOD_ACCOUNT,
+        })
+        orders_data = robinhood_mcp_call("get_equity_orders", {
+            "account_number": ROBINHOOD_ACCOUNT,
+        })
 
-        acct = api.get_account()
-        positions = api.list_positions()
-        orders = api.list_orders(status="open")
+        cash = _safe_float(account_data, "cash", "cash_balance", "available_cash")
+        equity = _safe_float(account_data, "equity", "portfolio_value", "account_value")
+
+        positions = _parse_positions(positions_data)
+        orders = _parse_orders_list(orders_data)
 
         # Load optimal params
         opt_file = "/opt/hermes-trader/data/snapshots/optimal_params.json"
@@ -33,17 +45,17 @@ def rebalance() -> dict:
 
         result = {
             "timestamp": datetime.utcnow().isoformat(),
-            "cash": float(acct.cash),
-            "equity": float(acct.portfolio_value),
+            "cash": cash,
+            "equity": equity,
             "actions": [],
         }
 
-        exit_symbols = {o.symbol for o in orders}
+        exit_symbols = {o["symbol"] for o in orders}
 
         for pos in positions:
             sym = pos.symbol
-            entry = float(pos.avg_entry_price)
-            current = float(pos.current_price)
+            entry = pos.cost_basis / pos.qty if pos.qty > 0 else 0
+            current = pos.market_value / pos.qty if pos.qty > 0 else 0
             pnl_pct = (current / entry - 1) * 100 if entry > 0 else 0
 
             opt = opt_params.get(sym, {}).get("params", {})

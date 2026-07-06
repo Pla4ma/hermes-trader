@@ -2,11 +2,13 @@
 
 Checks open positions for exit conditions (take profit / stop loss).
 When an exit condition triggers, generates a close-order candidate.
+
+Uses the Robinhood MCP broker adapter (agent.robinhood.com/mcp/trading)
+for live position data instead of legacy broker.
 """
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Optional
 
@@ -22,38 +24,68 @@ class PositionMonitor:
         self.journal_path = Path(journal_path)
         self.positions_file = self.journal_path / "positions.json"
 
-    def get_alpaca_positions(self) -> list[dict]:
-        """Fetch live positions from Alpaca API."""
+    def get_robinhood_positions(self) -> list[dict]:
+        """Fetch live positions from Robinhood MCP API.
+
+        Uses the RobinhoodBrokerAdapter's MCP client to call
+        ``get_equity_positions`` on the Robinhood MCP trading endpoint.
+        """
         try:
-            import alpaca_trade_api as tradeapi
-            api_key = os.getenv("ALPACA_API_KEY", "")
-            secret_key = os.getenv("ALPACA_SECRET_KEY", "")
-            base_url = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
-            if not api_key or not secret_key:
-                return []
-            api = tradeapi.REST(api_key, secret_key, base_url)
+            from ..integrations.robinhood_broker import robinhood_mcp_call, ROBINHOOD_ACCOUNT
+
+            data = robinhood_mcp_call("get_equity_positions", {
+                "account_number": ROBINHOOD_ACCOUNT,
+            })
+
             positions = []
-            for p in api.list_positions():
+            # Handle different response shapes
+            if isinstance(data, dict):
+                raw = data.get("positions", data.get("results", data.get("holdings", [])))
+            elif isinstance(data, list):
+                raw = data
+            else:
+                return []
+
+            for p in raw:
+                if not isinstance(p, dict):
+                    continue
+                symbol = p.get("symbol", p.get("ticker", ""))
+                if not symbol:
+                    continue
+
+                qty = _safe_float(p, "quantity", "qty", "shares", "net_quantity", default=0.0)
+                if qty == 0:
+                    continue
+
+                entry_price = _safe_float(p, "average_buy_price", "average_cost", "cost_basis", default=0.0)
+                current_price = _safe_float(p, "last_price", "current_price", "price", default=0.0)
+                market_value = _safe_float(p, "market_value", "value", "market_value_today", default=0.0)
+                if market_value == 0.0 and qty > 0 and current_price > 0:
+                    market_value = qty * current_price
+
+                unrealized_pl = _safe_float(p, "unrealized_pl", "unrealized_gain", "unrealized_pnl", default=0.0)
+                unrealized_plpc = _safe_float(p, "unrealized_plpc", "unrealized_gain_pct", "unrealized_percent", default=0.0)
+
                 positions.append({
-                    "symbol": p.symbol,
-                    "qty": float(p.qty),
-                    "entry_price": float(p.avg_entry_price),
-                    "current_price": float(p.current_price),
-                    "unrealized_pl": float(p.unrealized_pl),
-                    "unrealized_plpc": float(p.unrealized_plpc),
-                    "market_value": float(p.market_value),
+                    "symbol": symbol,
+                    "qty": float(qty),
+                    "entry_price": float(entry_price),
+                    "current_price": float(current_price),
+                    "unrealized_pl": float(unrealized_pl),
+                    "unrealized_plpc": float(unrealized_plpc),
+                    "market_value": float(market_value),
                 })
             return positions
         except Exception as e:
-            logger.warning(f"Alpaca position fetch failed: {e}")
+            logger.warning(f"Robinhood position fetch failed: {e}")
             return []
 
     def get_open_positions(self) -> list[dict]:
-        """Load current open positions from Alpaca or journal."""
-        # Prefer live Alpaca positions
-        alpaca_pos = self.get_alpaca_positions()
-        if alpaca_pos:
-            return alpaca_pos
+        """Load current open positions from Robinhood or journal."""
+        # Prefer live Robinhood positions
+        rh_pos = self.get_robinhood_positions()
+        if rh_pos:
+            return rh_pos
         # Fallback to local journal
         if not self.positions_file.exists():
             return []
@@ -111,3 +143,17 @@ class PositionMonitor:
             }
 
         return None
+
+
+def _safe_float(data: dict, *keys: str, default: float = 0.0) -> float:
+    """Extract the first matching float from dict keys."""
+    if not isinstance(data, dict):
+        return default
+    for key in keys:
+        val = data.get(key)
+        if val is not None:
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                continue
+    return default

@@ -4,22 +4,35 @@ import json
 import os
 from datetime import datetime
 
+from .integrations.robinhood_broker import (
+    ROBINHOOD_ACCOUNT,
+    _parse_orders_list,
+    _parse_positions,
+    _safe_float,
+    robinhood_mcp_call,
+)
+
 
 def generate_portfolio_report() -> str:
     """Generate a comprehensive portfolio report."""
     try:
-        import alpaca_trade_api as tradeapi
-        api_key = os.getenv("ALPACA_API_KEY", "")
-        secret_key = os.getenv("ALPACA_SECRET_KEY", "")
-        base_url = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
-        api = tradeapi.REST(api_key, secret_key, base_url)
+        account_data = robinhood_mcp_call("get_accounts", {})
+        positions_data = robinhood_mcp_call("get_equity_positions", {
+            "account_number": ROBINHOOD_ACCOUNT,
+        })
+        orders_data = robinhood_mcp_call("get_equity_orders", {
+            "account_number": ROBINHOOD_ACCOUNT,
+        })
 
-        acct = api.get_account()
-        positions = api.list_positions()
-        orders = api.list_orders(status="open")
+        equity = _safe_float(account_data, "equity", "portfolio_value", "account_value")
+        cash = _safe_float(account_data, "cash", "cash_balance", "available_cash")
 
-        total_pnl = sum(float(p.unrealized_pl) for p in positions)
-        total_pnl_pct = (total_pnl / float(acct.portfolio_value) * 100) if float(acct.portfolio_value) > 0 else 0
+        positions = _parse_positions(positions_data)
+        orders = _parse_orders_list(orders_data)
+        open_orders = [o for o in orders if o.get("status") not in ("filled", "canceled", "expired", "rejected")]
+
+        total_pnl = sum(p.unrealized_pl for p in positions)
+        total_pnl_pct = (total_pnl / equity * 100) if equity > 0 else 0
 
         # Market regime
         try:
@@ -46,18 +59,20 @@ def generate_portfolio_report() -> str:
             f"📅 {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
             "",
             "💰 **Account**",
-            f"  Equity: ${acct.portfolio_value}",
-            f"  Cash: ${acct.cash}",
+            f"  Equity: ${equity:.2f}",
+            f"  Cash: ${cash:.2f}",
             f"  P&L: ${total_pnl:.3f} ({total_pnl_pct:+.2f}%)",
             "",
             "📈 **Positions**",
         ]
 
         for p in positions:
-            pnl = float(p.unrealized_pl)
-            pnl_pct = float(p.unrealized_plpc) * 100
+            pnl = p.unrealized_pl
+            pnl_pct = p.unrealized_plpc * 100
             emoji = "🟢" if pnl >= 0 else "🔴"
-            lines.append(f"  {emoji} {p.symbol}: ${p.avg_entry_price} → ${p.current_price} ({pnl_pct:+.2f}%)")
+            entry = p.cost_basis / p.qty if p.qty > 0 else 0
+            current = p.market_value / p.qty if p.qty > 0 else 0
+            lines.append(f"  {emoji} {p.symbol}: ${entry:.2f} → ${current:.2f} ({pnl_pct:+.2f}%)")
 
         if not positions:
             lines.append("  No open positions")
@@ -75,28 +90,26 @@ def generate_portfolio_report() -> str:
         if not alerts:
             lines.append("  ✅ No alerts")
 
-        if orders:
+        if open_orders:
             lines.extend([
                 "",
                 "🎯 **Exit Orders**",
             ])
-            for o in orders:
-                sl = f"${o.stop_price}" if o.stop_price else "N/A"
-                tp = f"${o.limit_price}" if o.limit_price else "N/A"
-                lines.append(f"  {o.symbol}: SL={sl} TP={tp}")
+            for o in open_orders:
+                sl = f"${o.get('stop_price', 'N/A')}" if o.get('stop_price') else "N/A"
+                tp = f"${o.get('limit_price', 'N/A')}" if o.get('limit_price') else "N/A"
+                lines.append(f"  {o['symbol']}: SL={sl} TP={tp}")
 
         lines.extend([
             "",
             "⚙️ **System**",
-            "  ✅ Alpaca API connected",
+            "  ✅ Robinhood MCP connected",
             "  ✅ Real market data (yfinance)",
             "  ✅ Auto-trading engine",
             "  ✅ Trailing stops",
             "  ✅ Position monitor (15 min)",
             "  ✅ Market regime detector",
             "  ✅ Risk dashboard",
-            "  ✅ 14 commits today",
-            "  ✅ 30/30 tests passing",
         ])
 
         return "\n".join(lines)

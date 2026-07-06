@@ -1,9 +1,8 @@
 """Auto-trading engine — discovers candidates and executes trades.
 
 This module is called by the cron jobs to autonomously scan, score,
-and execute trades on the live Alpaca account.
+and execute trades on the live Robinhood account via MCP.
 """
-
 import json
 import logging
 import os
@@ -13,14 +12,13 @@ from typing import Optional
 
 logger = logging.getLogger("hermes_trader.auto_trader")
 
+ACCOUNT_NUMBER = os.getenv("ROBINHOOD_ACCOUNT_NUMBER", "924058324")
 
-def get_alpaca_api():
-    """Get Alpaca API client from env vars."""
-    import alpaca_trade_api as tradeapi
-    api_key = os.getenv("ALPACA_API_KEY", "")
-    secret_key = os.getenv("ALPACA_SECRET_KEY", "")
-    base_url = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
-    return tradeapi.REST(api_key, secret_key, base_url)
+
+def _get_broker():
+    """Get the Robinhood broker adapter instance."""
+    from .integrations.robinhood_broker import RobinhoodBroker
+    return RobinhoodBroker(account_number=ACCOUNT_NUMBER)
 
 
 def scan_and_score(symbols: list[str] = None) -> list[dict]:
@@ -110,13 +108,13 @@ def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
     """Scan, score, and execute the best trade if cash available.
 
     Integrates: GEX, PCR, IV Rank, Kelly sizing, earnings check, VIX term structure.
+    Executes via Robinhood MCP broker adapter.
     """
-    from alpaca.trading.enums import OrderSide, TimeInForce
+    broker = _get_broker()
 
-    api = get_alpaca_api()
-    acct = api.get_account()
-    cash = float(acct.cash)
-    held = {p.symbol for p in api.list_positions()}
+    # ─── Get account state from Robinhood ───
+    cash = broker.get_account_cash()
+    held = broker.get_held_symbols()
 
     # ─── Options Analytics (institutional-grade) ───
     analytics = {}
@@ -211,14 +209,14 @@ def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
         notional *= 0.5
         result["note"] = f"One research source disagrees — reducing size by 50% to ${notional:.2f}"
 
-    # Execute trade
+    # Execute trade via Robinhood MCP
     try:
-        order = api.submit_order(
+        order = broker.place_equity_order(
             symbol=best["symbol"],
+            side="buy",
             notional=round(notional, 2),
-            side=OrderSide.BUY,
-            type="market",
-            time_in_force=TimeInForce.DAY,
+            order_type="market",
+            time_in_force="day",
         )
 
         result["action"] = "BUY"
@@ -226,7 +224,7 @@ def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
         result["notional"] = notional
         result["score"] = best["score"]
         result["price"] = best["price"]
-        result["order_id"] = str(order.id)
+        result["order_id"] = order.get("order_id", "")
         result["stop_loss"] = best["stop"]
         result["take_profit"] = best["target"]
 
@@ -236,7 +234,9 @@ def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
             "action": "BUY",
             "symbol": best["symbol"],
             "notional": notional,
-            "order_id": str(order.id),
+            "order_id": order.get("order_id", ""),
+            "broker": "robinhood_mcp",
+            "account_number": ACCOUNT_NUMBER,
             "strategy": "auto_confluence",
             "confluence_score": best["score"],
             "rsi": best["rsi"],
@@ -249,7 +249,7 @@ def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
         with open(journal_path, "a") as f:
             f.write(json.dumps(entry) + "\n")
 
-        logger.info(f"AUTO-TRADE: {best['symbol']} ${notional:.2f} score={best['score']}")
+        logger.info(f"AUTO-TRADE: {best['symbol']} ${notional:.2f} score={best['score']} via Robinhood MCP")
 
     except Exception as e:
         result["action"] = "error"
@@ -317,27 +317,33 @@ def _load_optimal_params(symbol: str) -> dict:
 def manage_exits() -> dict:
     """Check positions and manage exits with trailing stops + profit-taking.
 
-    For fractional positions, only ONE exit order is allowed on Alpaca.
+    All orders routed through Robinhood MCP broker adapter.
     Strategy:
     - Set SL at 1.5% below entry if no exit order exists
     - If profit > 2.5%, tighten SL to trail by 0.8%
     - If profit > 4%, sell 50% (partial profit-taking) via cron
     - If profit > 8%, sell remaining via cron
     """
-    from alpaca.trading.enums import OrderSide, TimeInForce
-
-    api = get_alpaca_api()
-    positions = api.list_positions()
-    open_orders = api.list_orders(status="open")
+    broker = _get_broker()
+    positions = broker.list_positions()
+    open_orders = broker.list_open_orders()
     actions = []
 
     # Get symbols with existing exit orders
-    exit_symbols = {o.symbol for o in open_orders}
+    exit_symbols = {o.get("symbol", "") for o in open_orders}
 
     for pos in positions:
-        entry = float(pos.avg_entry_price)
-        current = float(pos.current_price)
-        qty = float(pos.qty)
+        symbol = pos.get("symbol", "")
+        if not symbol:
+            continue
+
+        entry = float(pos.get("avg_entry_price", 0) or pos.get("average_entry_price", 0) or 0)
+        current = float(pos.get("current_price", 0) or pos.get("last_price", 0) or 0)
+        qty = float(pos.get("quantity", 0) or pos.get("qty", 0) or 0)
+
+        if entry <= 0 or qty <= 0:
+            continue
+
         pnl_pct = (current / entry - 1) * 100 if entry > 0 else 0
 
         # Trailing stop logic
@@ -346,48 +352,64 @@ def manage_exits() -> dict:
             new_sl = round(current * 0.992, 2)
             old_sl = round(entry * 0.985, 2)
             if new_sl > old_sl:
-                # Cancel existing order and set tighter stop
+                # Cancel existing exit orders for this symbol
                 for o in open_orders:
-                    if o.symbol == pos.symbol:
-                        api.cancel_order(o.id)
-                        import time; time.sleep(0.5)
+                    if o.get("symbol", "") == symbol:
+                        try:
+                            broker.cancel_order(o.get("order_id", o.get("id", "")))
+                            import time; time.sleep(0.5)
+                        except Exception:
+                            pass
+
+                # Place new trailing stop order via Robinhood MCP
                 try:
-                    sl = api.submit_order(
-                        symbol=pos.symbol, qty=str(qty), side=OrderSide.SELL,
-                        type="stop", stop_price=str(new_sl),
-                        time_in_force=TimeInForce.DAY,
+                    order = broker.place_equity_order(
+                        symbol=symbol,
+                        side="sell",
+                        quantity=int(qty) if qty == int(qty) else None,
+                        notional=round(current * qty, 2) if qty != int(qty) else None,
+                        order_type="stop",
+                        time_in_force="day",
                     )
                     actions.append({
-                        "symbol": pos.symbol, "action": "TRAILING_SL",
+                        "symbol": symbol, "action": "TRAILING_SL",
                         "old_sl": old_sl, "new_sl": new_sl,
                         "pnl_pct": round(pnl_pct, 2),
+                        "order_id": order.get("order_id", ""),
                     })
                 except Exception as e:
-                    actions.append({"symbol": pos.symbol, "action": "SL_ERROR", "error": str(e)})
+                    actions.append({"symbol": symbol, "action": "SL_ERROR", "error": str(e)})
 
-        elif pos.symbol not in exit_symbols:
+        elif symbol not in exit_symbols:
             # No exit order — set initial SL at 1.5%
             sl_price = round(entry * 0.985, 2)
             try:
-                sl = api.submit_order(
-                    symbol=pos.symbol, qty=str(qty), side=OrderSide.SELL,
-                    type="stop", stop_price=str(sl_price),
-                    time_in_force=TimeInForce.DAY,
+                order = broker.place_equity_order(
+                    symbol=symbol,
+                    side="sell",
+                    quantity=int(qty) if qty == int(qty) else None,
+                    notional=round(current * qty, 2) if qty != int(qty) else None,
+                    order_type="stop",
+                    time_in_force="day",
                 )
-                actions.append({"symbol": pos.symbol, "action": "SL_SET", "price": sl_price})
+                actions.append({
+                    "symbol": symbol, "action": "SL_SET",
+                    "price": sl_price,
+                    "order_id": order.get("order_id", ""),
+                })
             except Exception as e:
-                actions.append({"symbol": pos.symbol, "action": "SL_ERROR", "error": str(e)})
+                actions.append({"symbol": symbol, "action": "SL_ERROR", "error": str(e)})
 
         # Profit-taking check (log for cron to execute)
         if pnl_pct >= 4.0:
             actions.append({
-                "symbol": pos.symbol, "action": "TP_SIGNAL",
+                "symbol": symbol, "action": "TP_SIGNAL",
                 "pnl_pct": round(pnl_pct, 2),
                 "recommendation": "SELL_50%",
             })
         elif pnl_pct >= 8.0:
             actions.append({
-                "symbol": pos.symbol, "action": "TP_SIGNAL",
+                "symbol": symbol, "action": "TP_SIGNAL",
                 "pnl_pct": round(pnl_pct, 2),
                 "recommendation": "SELL_ALL",
             })

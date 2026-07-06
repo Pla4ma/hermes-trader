@@ -1,9 +1,9 @@
-"""Tests for the Alpaca options backtest validator.
+"""Tests for the yfinance options backtest validator.
 
 Tests cover:
 - OptionsBar and Trade dataclasses
 - BacktestReport sample-size gating
-- BacktestValidator with mocked Alpaca data
+- BacktestValidator with mocked yfinance data
 - Bid/ask fill modeling
 - Early assignment simulation
 - Edge cases (empty data, insufficient samples)
@@ -11,6 +11,7 @@ Tests cover:
 
 import datetime
 import math
+import sys
 from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
@@ -236,7 +237,7 @@ class TestBacktestReport:
             profit_factor=3.0, roi_pct=15.0, max_drawdown_pct=5.0,
             total_trades=50, sample_sufficient=False,
             reason="Insufficient sample",
-            data_source="alpaca_options",
+            data_source="yfinance_options",
         )
         assert report.sample_sufficient is False
         assert report.total_trades < MIN_SAMPLE_SIZE
@@ -248,7 +249,7 @@ class TestBacktestReport:
             profit_factor=2.0, roi_pct=12.0, max_drawdown_pct=8.0,
             total_trades=150, sample_sufficient=True,
             reason="All criteria met",
-            data_source="alpaca_options",
+            data_source="yfinance_options",
         )
         assert report.sample_sufficient is True
         assert report.valid is True
@@ -259,7 +260,7 @@ class TestBacktestReport:
             valid=False, sharpe_ratio=1.0, win_rate=50.0,
             profit_factor=1.0, roi_pct=0.0, max_drawdown_pct=0.0,
             total_trades=MIN_SAMPLE_SIZE, sample_sufficient=True,
-            reason="", data_source="alpaca_options",
+            reason="", data_source="yfinance_options",
         )
         assert report.sample_sufficient is True
 
@@ -269,7 +270,7 @@ class TestBacktestReport:
             valid=False, sharpe_ratio=3.0, win_rate=90.0,
             profit_factor=5.0, roi_pct=50.0, max_drawdown_pct=2.0,
             total_trades=99, sample_sufficient=False,
-            reason="", data_source="alpaca_options",
+            reason="", data_source="yfinance_options",
         )
         assert report.sample_sufficient is False
 
@@ -388,31 +389,26 @@ class TestBacktestValidator:
 
 
 # ══════════════════════════════════════════════════════════════
-# Unit Tests — Alpaca Data Loading (Mocked)
+# Unit Tests — Data Loading (Mocked)
 # ══════════════════════════════════════════════════════════════
 
-class TestAlpacaDataLoading:
-    def test_data_client_initialization(self):
-        """Data client should initialize with env vars."""
+class TestDataLoading:
+    def test_yf_ticker_initialization(self):
+        """yf ticker should initialize when yfinance is installed."""
         v = BacktestValidator()
-        with patch.dict('os.environ', {
-            'ALPACA_API_KEY': 'test_key',
-            'ALPACA_SECRET_KEY': 'test_secret',
-        }):
-            with patch('alpaca.data.historical.OptionHistoricalDataClient') as mock_client:
-                client = v._get_data_client()
-                assert client is not None
+        mock_yf = MagicMock()
+        with patch.dict('sys.modules', {'yfinance': mock_yf}):
+            mock_ticker = MagicMock()
+            mock_yf.Ticker.return_value = mock_ticker
+            ticker = v._get_yf_ticker("SPY")
+            assert ticker is not None
 
-    def test_data_client_missing_keys(self):
-        """Data client should return None without API keys."""
+    def test_yf_ticker_missing_library(self):
+        """Should return None when yfinance not installed."""
         v = BacktestValidator()
-        with patch.dict('os.environ', {}, clear=True):
-            # Remove any existing keys
-            import os
-            os.environ.pop('ALPACA_API_KEY', None)
-            os.environ.pop('ALPACA_SECRET_KEY', None)
-            client = v._get_data_client()
-            assert client is None
+        with patch.dict('sys.modules', {'yfinance': None}):
+            ticker = v._get_yf_ticker("SPY")
+            assert ticker is None
 
     def test_parse_option_symbol_call(self):
         """Should parse call option symbol correctly."""
@@ -440,11 +436,11 @@ class TestAlpacaDataLoading:
         assert v._parse_option_symbol("INVALID") is None
         assert v._parse_option_symbol("") is None
 
-    def test_load_alpaca_options_no_client(self):
-        """Should return None when no Alpaca client available."""
+    def test_load_yfinance_options_no_ticker(self):
+        """Should return None when yfinance ticker unavailable."""
         v = BacktestValidator()
-        with patch.object(v, '_get_data_client', return_value=None):
-            result = v._load_alpaca_options("SPY", "call", 0.005, 45)
+        with patch.object(v, '_get_yf_ticker', return_value=None):
+            result = v._load_yfinance_options("SPY", "call", 0.005, 45)
             assert result is None
 
 
@@ -592,9 +588,9 @@ class TestEarlyAssignment:
 
 class TestValidateTrade:
     def test_validate_returns_report_when_no_data(self):
-        """Should return report with data unavailable when no Alpaca client."""
+        """Should return report with data unavailable when no yfinance ticker."""
         v = BacktestValidator()
-        with patch.object(v, '_get_data_client', return_value=None):
+        with patch.object(v, '_get_yf_ticker', return_value=None):
             report = v.validate_trade(symbol="SPY")
             assert report.valid is False
             assert "unavailable" in report.reason.lower()
@@ -602,7 +598,7 @@ class TestValidateTrade:
     def test_validate_returns_report_on_exception(self):
         """Should return report with exception info on error."""
         v = BacktestValidator()
-        with patch.object(v, '_load_alpaca_options', side_effect=Exception("test error")):
+        with patch.object(v, '_load_yfinance_options', side_effect=Exception("test error")):
             report = v.validate_trade(symbol="SPY")
             assert report.valid is False
             assert "exception" in report.reason.lower()
@@ -610,7 +606,7 @@ class TestValidateTrade:
     def test_validate_legacy_interface(self, sample_trades):
         """Legacy interface should return dict format."""
         v = BacktestValidator()
-        with patch.object(v, '_load_alpaca_options', return_value=None):
+        with patch.object(v, '_load_yfinance_options', return_value=None):
             result = v.validate_trade_legacy(symbol="SPY")
             assert isinstance(result, dict)
             assert "valid" in result
@@ -618,7 +614,7 @@ class TestValidateTrade:
             assert "data_source" in result
 
     def test_validate_with_mocked_data(self):
-        """Full validation with mocked Alpaca data."""
+        """Full validation with mocked yfinance data."""
         import pandas as pd
         v = BacktestValidator()
 
@@ -639,9 +635,9 @@ class TestValidateTrade:
             })
         mock_data = pd.DataFrame(rows)
 
-        with patch.object(v, '_load_alpaca_options', return_value=mock_data):
+        with patch.object(v, '_load_yfinance_options', return_value=mock_data):
             report = v.validate_trade(symbol="SPY")
-            assert report.data_source == "alpaca_options"
+            assert report.data_source == "yfinance_options"
             assert isinstance(report.total_trades, int)
 
 
@@ -690,7 +686,7 @@ class TestEdgeCases:
             valid=True, sharpe_ratio=1.5, win_rate=60.0,
             profit_factor=2.0, roi_pct=12.0, max_drawdown_pct=8.0,
             total_trades=150, sample_sufficient=True,
-            reason="All criteria met", data_source="alpaca_options",
+            reason="All criteria met", data_source="yfinance_options",
         )
         assert report.valid is True
         assert report.sharpe_ratio == 1.5
@@ -700,4 +696,4 @@ class TestEdgeCases:
         assert report.max_drawdown_pct == 8.0
         assert report.total_trades == 150
         assert report.sample_sufficient is True
-        assert report.data_source == "alpaca_options"
+        assert report.data_source == "yfinance_options"

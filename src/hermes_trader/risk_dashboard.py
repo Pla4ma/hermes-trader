@@ -4,27 +4,36 @@ import json
 import os
 from datetime import datetime
 
+from .integrations.robinhood_broker import (
+    ROBINHOOD_ACCOUNT,
+    _parse_orders_list,
+    _parse_positions,
+    _safe_float,
+    robinhood_mcp_call,
+)
+
 
 def generate_risk_dashboard() -> dict:
     """Generate comprehensive risk metrics."""
     try:
-        import alpaca_trade_api as tradeapi
-        api_key = os.getenv("ALPACA_API_KEY", "")
-        secret_key = os.getenv("ALPACA_SECRET_KEY", "")
-        base_url = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
-        api = tradeapi.REST(api_key, secret_key, base_url)
+        account_data = robinhood_mcp_call("get_accounts", {})
+        positions_data = robinhood_mcp_call("get_equity_positions", {
+            "account_number": ROBINHOOD_ACCOUNT,
+        })
+        orders_data = robinhood_mcp_call("get_equity_orders", {
+            "account_number": ROBINHOOD_ACCOUNT,
+        })
 
-        acct = api.get_account()
-        positions = api.list_positions()
-        orders = api.list_orders(status="open")
+        equity = _safe_float(account_data, "equity", "portfolio_value", "account_value")
+        cash = _safe_float(account_data, "cash", "cash_balance", "available_cash")
+        buying_power = _safe_float(account_data, "buying_power", "instant_buying_power")
 
-        equity = float(acct.portfolio_value)
-        cash = float(acct.cash)
-        buying_power = float(acct.buying_power)
+        positions = _parse_positions(positions_data)
+        orders = _parse_orders_list(orders_data)
 
         # Position metrics
-        total_position_value = sum(abs(float(p.market_value)) for p in positions)
-        total_pnl = sum(float(p.unrealized_pl) for p in positions)
+        total_position_value = sum(abs(p.market_value) for p in positions)
+        total_pnl = sum(p.unrealized_pl for p in positions)
         total_pnl_pct = (total_pnl / equity * 100) if equity > 0 else 0
 
         # Risk metrics
@@ -40,7 +49,7 @@ def generate_risk_dashboard() -> dict:
         max_single_position = 0
         concentration_symbol = ""
         for p in positions:
-            mv = abs(float(p.market_value))
+            mv = abs(p.market_value)
             if mv > max_single_position:
                 max_single_position = mv
                 concentration_symbol = p.symbol
@@ -52,7 +61,7 @@ def generate_risk_dashboard() -> dict:
         drawdown = (initial_equity - equity) / initial_equity * 100 if initial_equity > 0 else 0
 
         # Exit order coverage
-        exit_symbols = {o.symbol for o in orders}
+        exit_symbols = {o["symbol"] for o in orders}
         positions_without_exits = [p.symbol for p in positions if p.symbol not in exit_symbols]
 
         dashboard = {
@@ -83,22 +92,22 @@ def generate_risk_dashboard() -> dict:
             "positions_detail": [
                 {
                     "symbol": p.symbol,
-                    "qty": float(p.qty),
-                    "entry": float(p.avg_entry_price),
-                    "current": float(p.current_price),
-                    "pnl": round(float(p.unrealized_pl), 3),
-                    "pnl_pct": round(float(p.unrealized_plpc) * 100, 2),
-                    "market_value": round(float(p.market_value), 2),
+                    "qty": p.qty,
+                    "entry": round(p.cost_basis / p.qty, 2) if p.qty > 0 else 0,
+                    "current": round(p.market_value / p.qty, 2) if p.qty > 0 else 0,
+                    "pnl": round(p.unrealized_pl, 3),
+                    "pnl_pct": round(p.unrealized_plpc * 100, 2),
+                    "market_value": round(p.market_value, 2),
                 }
                 for p in positions
             ],
             "open_exits": [
                 {
-                    "symbol": o.symbol,
-                    "side": o.side,
-                    "type": o.order_type,
-                    "limit": o.limit_price,
-                    "stop": o.stop_price,
+                    "symbol": o["symbol"],
+                    "side": o["side"],
+                    "type": o.get("order_type", ""),
+                    "limit": o.get("limit_price"),
+                    "stop": o.get("stop_price"),
                 }
                 for o in orders
             ],

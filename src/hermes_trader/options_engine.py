@@ -13,45 +13,369 @@ NEW: Institutional-Grade Signals (v5):
 - Charm decay timing: Entry timing based on delta decay rates (ATM charm peaks)
 - IV surface fair value: Compare market IV vs SVI/SSVI fitted surface
 - GEX-aware position management: Regime-based sizing and direction
+
+BACKEND: Robinhood MCP (migrated to Robinhood MCP July 2026)
 """
 
 import json
 import math
 import os
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Optional
+from dataclasses import dataclass, field
+
+import requests
 
 logger = logging.getLogger("hermes_trader.options_engine")
+
+ROBINHOOD_API_BASE = "https://api.robinhood.com"
+ROBINHOOD_TOKEN_PATH = os.path.expanduser("~/.hermes/mcp-tokens/robinhood.json")
+ROBINHOOD_ACCOUNT_NUMBER = os.getenv("ROBINHOOD_ACCOUNT_NUMBER", "924058324")
+
+
+# ---------------------------------------------------------------------------
+# Robinhood API Client (replaces legacy broker SDK)
+# ---------------------------------------------------------------------------
+class RobinhoodClient:
+    """Thin Python client for the Robinhood REST API.
+
+    Uses the same OAuth2 Bearer token that the Robinhood MCP server stores
+    at ``~/.hermes/mcp-tokens/robinhood.json``.
+    """
+
+    def __init__(self, token_path: str = ROBINHOOD_TOKEN_PATH):
+        self._token_path = token_path
+        self._session = requests.Session()
+        self._token_data: dict = {}
+        self._load_token()
+
+    # -- auth ---------------------------------------------------------------
+    def _load_token(self) -> None:
+        try:
+            with open(self._token_path) as f:
+                self._token_data = json.load(f)
+            self._session.headers.update({
+                "Authorization": f"Bearer {self._token_data['access_token']}",
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=1",
+                "Content-Type": "application/json",
+                "X-Robinhood-API-Version": "1.431.4",
+                "User-Agent": "hermes-trader/1.0",
+            })
+        except Exception as e:
+            logger.warning("Failed to load Robinhood token from %s: %s", self._token_path, e)
+
+    @property
+    def is_authenticated(self) -> bool:
+        return bool(self._token_data.get("access_token"))
+
+    # -- low-level helpers --------------------------------------------------
+    def _get(self, path: str, params: dict | None = None) -> dict | list:
+        url = f"{ROBINHOOD_API_BASE}{path}"
+        resp = self._session.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        return data
+
+    def _get_paginated(self, path: str, params: dict | None = None) -> list:
+        """Fetch all pages of a paginated endpoint."""
+        params = dict(params or {})
+        results = []
+        url = f"{ROBINHOOD_API_BASE}{path}"
+        while True:
+            resp = self._session.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            results.extend(data.get("results", []))
+            next_url = data.get("next")
+            if not next_url:
+                break
+            url = next_url
+            params = {}  # next URL already has params
+        return results
+
+    def _post(self, path: str, payload: dict) -> dict:
+        url = f"{ROBINHOOD_API_BASE}{path}"
+        resp = self._session.post(url, json=payload, timeout=15)
+        resp.raise_for_status()
+        return resp.json() if resp.content else {}
+
+    # -- stocks & quotes ----------------------------------------------------
+    def get_stock_quote(self, symbol: str) -> dict:
+        """Get quote for a stock symbol."""
+        data = self._get("/quotes/", params={"symbols": symbol})
+        results = data.get("results", [])
+        return results[0] if results else {}
+
+    def get_stock_price(self, symbol: str) -> float:
+        """Get last trade price for a symbol."""
+        quote = self.get_stock_quote(symbol)
+        return float(quote.get("last_trade_price", 0))
+
+    # -- accounts & portfolio -----------------------------------------------
+    def get_account(self, account_number: str | None = None) -> dict:
+        """Get account profile (cash, buying_power, etc.)."""
+        acct = account_number or ROBINHOOD_ACCOUNT_NUMBER
+        try:
+            return self._get(f"/accounts/{acct}/")
+        except Exception:
+            # Fallback: list all accounts
+            data = self._get("/accounts/", params={
+                "default_to_all_accounts": "true",
+                "include_managed": "true",
+            })
+            accounts = data.get("results", [])
+            return accounts[0] if accounts else {}
+
+    def get_portfolio(self, account_number: str | None = None) -> dict:
+        """Get portfolio profile (equity, market_value)."""
+        acct = account_number or ROBINHOOD_ACCOUNT_NUMBER
+        try:
+            return self._get(f"/portfolios/{acct}/")
+        except Exception:
+            data = self._get("/portfolios/")
+            results = data.get("results", [])
+            return results[0] if results else {}
+
+    def get_cash(self, account_number: str | None = None) -> float:
+        """Get available cash."""
+        acct = self.get_account(account_number)
+        return float(acct.get("cash", 0))
+
+    # -- options chain ------------------------------------------------------
+    def get_instrument_id(self, symbol: str) -> str | None:
+        """Get the Robinhood instrument ID for an equity symbol."""
+        data = self._get("/instruments/", params={
+            "symbol": symbol.upper(),
+            "state": "active",
+        })
+        instruments = data.get("results", [])
+        for inst in instruments:
+            if inst.get("symbol", "").upper() == symbol.upper():
+                return inst.get("id")
+        return instruments[0].get("id") if instruments else None
+
+    def get_option_chain(self, symbol: str) -> dict:
+        """Get option chain metadata for a symbol."""
+        inst_id = self.get_instrument_id(symbol)
+        if not inst_id:
+            return {"id": "", "expiration_dates": []}
+        data = self._get("/options/chains/", params={
+            "equity_instrument_ids": inst_id,
+            "state": "active",
+        })
+        chains = data.get("results", [])
+        return chains[0] if chains else {"id": "", "expiration_dates": []}
+
+    def get_option_instruments(
+        self,
+        symbol: str,
+        option_type: str | None = None,
+        expiration_date: str | None = None,
+    ) -> list[dict]:
+        """Get all option instruments for a symbol, optionally filtered."""
+        chain = self.get_option_chain(symbol)
+        chain_id = chain.get("id", "")
+        if not chain_id:
+            return []
+        params: dict = {"chain_id": chain_id, "state": "active"}
+        if option_type:
+            params["type"] = option_type
+        if expiration_date:
+            params["expiration_dates"] = expiration_date
+        return self._get_paginated("/options/instruments/", params=params)
+
+    def get_option_market_data(self, option_id: str) -> dict:
+        """Get market data (greeks, quotes, IV) for a single option."""
+        return self._get(f"/marketdata/options/{option_id}/")
+
+    def get_option_market_data_batch(self, option_ids: list[str]) -> list[dict]:
+        """Get market data for multiple options (sequential with small delay)."""
+        results = []
+        for oid in option_ids:
+            try:
+                md = self.get_option_market_data(oid)
+                md["_option_id"] = oid
+                results.append(md)
+            except Exception as e:
+                logger.debug("Market data fetch failed for %s: %s", oid, e)
+            # Small delay to avoid rate limiting
+            time.sleep(0.05)
+        return results
+
+    def get_options_with_market_data(
+        self,
+        symbol: str,
+        option_type: str | None = None,
+        expiration_date: str | None = None,
+        max_options: int = 200,
+    ) -> list[dict]:
+        """Get option instruments merged with their market data.
+
+        Returns list of dicts with keys:
+            symbol, id, strike_price, expiration_date, type,
+            bid_price, ask_price, last_trade_price,
+            delta, gamma, theta, vega, implied_volatility,
+            adjusted_mark_price
+        """
+        instruments = self.get_option_instruments(symbol, option_type, expiration_date)
+        if not instruments:
+            return []
+        # Cap to avoid too many API calls
+        instruments = instruments[:max_options]
+        option_ids = [inst["id"] for inst in instruments]
+        market_data_list = self.get_option_market_data_batch(option_ids)
+        # Index market data by option_id
+        md_by_id = {md["_option_id"]: md for md in market_data_list}
+        merged = []
+        for inst in instruments:
+            md = md_by_id.get(inst["id"], {})
+            greeks = md.get("greeks") or {}
+            merged.append({
+                "symbol": inst.get("symbol", ""),
+                "id": inst["id"],
+                "strike_price": float(inst.get("strike_price", 0)),
+                "expiration_date": inst.get("expiration_date", ""),
+                "type": inst.get("type", ""),
+                "bid_price": float(md.get("bid_price") or 0),
+                "ask_price": float(md.get("ask_price") or 0),
+                "last_trade_price": float(md.get("last_trade_price") or 0),
+                "adjusted_mark_price": float(md.get("adjusted_mark_price") or 0),
+                "delta": float(greeks.get("delta") or 0),
+                "gamma": float(greeks.get("gamma") or 0),
+                "theta": float(greeks.get("theta") or 0),
+                "vega": float(greeks.get("vega") or 0),
+                "implied_volatility": float(md.get("implied_volatility") or greeks.get("implied_volatility") or 0),
+                "open_interest": int(md.get("open_interest") or 0),
+                "volume": int(md.get("volume") or 0),
+            })
+        return merged
+
+    # -- option orders ------------------------------------------------------
+    def place_option_order(
+        self,
+        symbol: str,
+        option_id: str,
+        side: str = "buy",
+        quantity: int = 1,
+        price: float = 0.0,
+        time_in_force: str = "gfd",
+        account_number: str | None = None,
+    ) -> dict:
+        """Place a single-leg option order.
+
+        Args:
+            symbol: Underlying symbol (e.g., "SPY")
+            option_id: Robinhood option instrument ID
+            side: "buy" or "sell"
+            quantity: Number of contracts
+            price: Limit price (must be > 0 for limit orders)
+            time_in_force: "gfd" (good for day) or "gtc"
+            account_number: Robinhood account number
+        """
+        acct = account_number or ROBINHOOD_ACCOUNT_NUMBER
+        account_url = f"{ROBINHOOD_API_BASE}/accounts/{acct}/"
+        payload = {
+            "account": account_url,
+            "direction": "debit" if side == "buy" else "credit",
+            "legs": [{
+                "option_id": option_id,
+                "side": side,
+                "position_effect": "open" if side == "buy" else "close",
+                "ratio_quantity": 1,
+            }],
+            "price": str(price),
+            "quantity": str(quantity),
+            "type": "limit" if price > 0 else "market",
+            "time_in_force": time_in_force,
+            "trigger": "immediate",
+            "market_hours": "regular_hours",
+            "override_day_trade_checks": True,
+            "override_dtbp_checks": True,
+        }
+        return self._post("/options/orders/", payload)
+
+    def get_option_orders(self, status: str = "all", limit: int = 50) -> list[dict]:
+        """Get option order history."""
+        params = {"state": status}
+        if limit:
+            params["limit"] = str(limit)
+        data = self._get("/options/orders/", params=params)
+        return data.get("results", [])
+
+
+# ---------------------------------------------------------------------------
+# Simple data holder (replaces legacy options snapshot)
+# ---------------------------------------------------------------------------
+@dataclass
+class OptionGreeks:
+    delta: float = 0.0
+    gamma: float = 0.0
+    theta: float = 0.0
+    vega: float = 0.0
+
+
+@dataclass
+class OptionQuote:
+    bid_price: float = 0.0
+    ask_price: float = 0.0
+
+
+@dataclass
+class OptionSnapshot:
+    """Mimics legacy options snapshot for backward compatibility."""
+    symbol: str = ""
+    strike_price: float = 0.0
+    expiration_date: str = ""
+    option_type: str = ""
+    greeks: OptionGreeks = field(default_factory=OptionGreeks)
+    latest_quote: OptionQuote = field(default_factory=OptionQuote)
+    implied_volatility: float = 0.0
+    option_id: str = ""
+    last_trade_price: float = 0.0
+    open_interest: int = 0
+    volume: int = 0
+
+
+def _robinhood_to_snapshot(opt: dict) -> OptionSnapshot:
+    """Convert a Robinhood options dict to an OptionSnapshot."""
+    return OptionSnapshot(
+        symbol=opt.get("symbol", ""),
+        strike_price=opt.get("strike_price", 0),
+        expiration_date=opt.get("expiration_date", ""),
+        option_type=opt.get("type", ""),
+        greeks=OptionGreeks(
+            delta=opt.get("delta", 0),
+            gamma=opt.get("gamma", 0),
+            theta=opt.get("theta", 0),
+            vega=opt.get("vega", 0),
+        ),
+        latest_quote=OptionQuote(
+            bid_price=opt.get("bid_price", 0),
+            ask_price=opt.get("ask_price", 0),
+        ),
+        implied_volatility=opt.get("implied_volatility", 0),
+        option_id=opt.get("id", ""),
+        last_trade_price=opt.get("last_trade_price", 0),
+        open_interest=opt.get("open_interest", 0),
+        volume=opt.get("volume", 0),
+    )
 
 
 class OptionsEngine:
     """Full-featured options trading engine with institutional-grade signals."""
 
     def __init__(self):
-        self.api_key = os.getenv("ALPACA_API_KEY", "")
-        self.secret_key = os.getenv("ALPACA_SECRET_KEY", "")
-        self.base_url = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
-        self._client = None
-        self._opt_client = None
-        self._trading_client = None
+        self._rh = RobinhoodClient()
 
     @property
-    def opt_client(self):
-        if self._opt_client is None:
-            from alpaca.data.historical import OptionHistoricalDataClient
-            self._opt_client = OptionHistoricalDataClient(self.api_key, self.secret_key)
-        return self._opt_client
-
-    @property
-    def trading_client(self):
-        if self._trading_client is None:
-            from alpaca.trading.client import TradingClient
-            self._trading_client = TradingClient(self.api_key, self.secret_key, paper=False)
-        return self._trading_client
+    def rh(self) -> RobinhoodClient:
+        return self._rh
 
     def get_spy_price(self) -> float:
-        """Get current SPY price."""
+        """Get current SPY price via yfinance (fast, no auth needed)."""
         import yfinance as yf
         return yf.Ticker("SPY").fast_info.get("lastPrice", 0)
 
@@ -117,14 +441,9 @@ class OptionsEngine:
             score += 3
 
         # Direction interpretation:
-        # For calls: vanna > 0 → as IV drops, delta increases → dealer must sell to hedge → bearish flow
-        # For puts:  vanna < 0 → as IV drops, delta gets less negative → dealer must buy to hedge → bullish flow
-        # Net bullish flow when: put vanna (negative) × IV decline
         if option_type == "put":
-            # Negative vanna + IV dropping = bullish vanna flow (dealers buying)
             flow_direction = "bullish" if vanna < 0 else "bearish"
         else:
-            # Positive vanna + IV dropping = bearish vanna flow (dealers selling)
             flow_direction = "bearish" if vanna > 0 else "bullish"
 
         return {
@@ -147,17 +466,6 @@ class OptionsEngine:
         CHARM = ∂Δ/∂τ (how fast delta decays with time).
 
         Key insight: Charm peaks for ATM options near expiry.
-        - ATM call: charm > 0 → delta increases toward 1 as time passes
-        - ATM put:  charm < 0 → delta decreases toward -1 as time passes
-        - OTM options: charm drives delta toward 0 (worthless)
-
-        Entry timing:
-        - For LONG calls: enter when charm is positive and high → delta
-          will naturally increase over time → favorable
-        - For LONG puts: enter when charm is negative and large magnitude → delta
-          will naturally become more negative → favorable
-        - Best entry: 5-14 DTE where charm decay is most pronounced
-
         Returns dict with charm, charm_timing_score (0-15), and timing_grade.
         """
         try:
@@ -178,8 +486,6 @@ class OptionsEngine:
         # Charm timing score (0-15):
         abs_charm = abs(charm)
         score = 0
-
-        # High absolute charm = fast delta movement = good timing
         if abs_charm > 0.10:
             score += 15
         elif abs_charm > 0.07:
@@ -195,9 +501,8 @@ class OptionsEngine:
         moneyness = K / S
         dte = tau
 
-        # Best charm timing: ATM (0.98-1.02 moneyness) with 1-7 DTE
         if 0.98 <= moneyness <= 1.02 and dte <= 7:
-            timing_grade = "EXCELLENT"  # ATM near expiry = max charm
+            timing_grade = "EXCELLENT"
         elif 0.96 <= moneyness <= 1.04 and dte <= 14:
             timing_grade = "GOOD"
         elif 0.90 <= moneyness <= 1.10 and dte <= 21:
@@ -205,12 +510,11 @@ class OptionsEngine:
         else:
             timing_grade = "WEAK"
 
-        # Charm is favorable for long options if it moves delta in our favor
         favorable = False
         if option_type == "call" and charm > 0:
-            favorable = True  # Delta increases over time → good for long calls
+            favorable = True
         elif option_type == "put" and charm < 0:
-            favorable = True  # Delta becomes more negative → good for long puts
+            favorable = True
 
         return {
             "charm": round(charm, 6),
@@ -229,21 +533,11 @@ class OptionsEngine:
         """
         Compare market IV against IV surface fair value.
 
-        The IV surface uses SVI parametrization to fit a smooth surface
-        through all observed IVs. If the market price deviates significantly
-        from the surface, we have a mispricing signal.
-
-        Key signals:
-        - Market IV >> Surface IV: option is OVERPRICED → avoid or sell
-        - Market IV << Surface IV: option is CHEAP → buy signal
-        - Skew deviation: if put IV is way above call IV at same delta,
-          there's fear premium → contrarian buy opportunity
-
         Returns dict with fair_value_score (0-10) and iv_premium.
         """
         score = 0
         iv_premium = 0.0
-        fair_iv = market_iv  # Default: assume fair
+        fair_iv = market_iv
 
         try:
             from .iv_surface import IVSurface, bs_implied_vol
@@ -251,12 +545,10 @@ class OptionsEngine:
             from hermes_trader.iv_surface import IVSurface, bs_implied_vol
 
         try:
-            # Build a minimal IV surface from the option chain
             surface = IVSurface(spot=spot, rate=0.05)
             chain_data = self._get_chain_for_surface(symbol, spot)
 
             if chain_data and len(chain_data) > 10:
-                # Fit SVI to each expiry slice
                 for expiry_data in chain_data:
                     expiry = expiry_data["tte"]
                     strikes = expiry_data["strikes"]
@@ -272,47 +564,41 @@ class OptionsEngine:
                     surface.fit_svi()
                     tte_years = dte / 365.0
                     fair_iv = surface.get_iv(strike, tte_years, method="svi")
-
-                    # Compare market vs fair value
                     iv_premium = (market_iv - fair_iv) / fair_iv if fair_iv > 0 else 0
 
                     if iv_premium < -0.10:
-                        # Market IV 10%+ below surface → cheap option → BUY
                         score = 10
                     elif iv_premium < -0.05:
                         score = 7
                     elif iv_premium < -0.02:
                         score = 4
                     elif iv_premium < 0.02:
-                        score = 2  # Fairly priced
+                        score = 2
                     elif iv_premium < 0.05:
-                        score = 0  # Slightly expensive
+                        score = 0
                     elif iv_premium < 0.10:
-                        score = 0  # Expensive
+                        score = 0
                     else:
-                        score = 0  # Very expensive → avoid
+                        score = 0
 
-                    # Also check skew signal
                     if surface.svi_params:
                         sorted_exp = sorted(surface.slices.keys())
                         if sorted_exp:
                             nearest_exp = min(sorted_exp, key=lambda e: abs(e - tte_years))
                             try:
                                 skew_val = surface.skew(nearest_exp)
-                                # Steep negative skew = fear → contrarian opportunity
                                 if skew_val < -0.03 and option_type == "put":
                                     score = min(score + 3, 10)
                             except Exception:
                                 pass
         except Exception as e:
             logger.debug("IV surface computation failed: %s", e)
-            # Fallback: use simple IV percentile heuristics
             if market_iv < 0.15:
-                score = 5  # Low IV → options cheap
+                score = 5
             elif market_iv < 0.20:
                 score = 3
             elif market_iv > 0.35:
-                score = 0  # High IV → options expensive
+                score = 0
 
         return {
             "fair_iv": round(fair_iv, 4),
@@ -325,43 +611,46 @@ class OptionsEngine:
     def _get_chain_for_surface(self, symbol: str, spot: float) -> list:
         """Fetch option chain data formatted for IV surface construction."""
         try:
-            from alpaca.data.requests import OptionChainRequest
             today = datetime.utcnow().date()
-            req = OptionChainRequest(
-                underlying_symbol=symbol,
-                expiration_date_gte=today + timedelta(days=1),
-                expiration_date_lte=today + timedelta(days=60),
-            )
-            chain = self.opt_client.get_option_chain(req)
+            gte = today + timedelta(days=1)
+            lte = today + timedelta(days=60)
 
-            # Group by expiry
-            by_expiry = {}
-            for sym, snap in chain.items():
-                if not snap.latest_quote or not snap.greeks:
+            # Get options with market data from Robinhood
+            instruments = self.rh.get_option_instruments(symbol)
+            if not instruments:
+                return []
+
+            # Filter to date range and collect by expiry
+            by_expiry: dict[int, dict] = {}
+            for inst in instruments:
+                exp_str = inst.get("expiration_date", "")
+                if not exp_str:
                     continue
-                q = snap.latest_quote
-                bid = float(q.bid_price or 0)
-                ask = float(q.ask_price or 0)
-                if bid <= 0 or ask <= 0:
+                try:
+                    exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                if not (gte <= exp_date <= lte):
                     continue
 
-                mid = (bid + ask) / 2
-                iv = float(snap.implied_volatility or 0)
+                tte = max(1, (exp_date - today).days)
+                strike = float(inst.get("strike_price", 0))
+                if strike <= 0:
+                    continue
+
+                # Get market data for IV
+                try:
+                    md = self.rh.get_option_market_data(inst["id"])
+                    iv = float(md.get("implied_volatility") or 0)
+                    greeks = md.get("greeks") or {}
+                    bid = float(md.get("bid_price") or 0)
+                    ask = float(md.get("ask_price") or 0)
+                except Exception:
+                    continue
+
                 if iv <= 0 or iv > 3.0:
                     continue
-
-                is_call = "C" in sym
-                try:
-                    strike = float(sym.split("C" if is_call else "P")[1]) / 1000
-                except Exception:
-                    continue
-
-                # Parse expiry from symbol (format: SPY250704C00550000)
-                try:
-                    exp_str = sym[len(symbol):][:6]
-                    exp_date = datetime.strptime(exp_str, "%y%m%d").date()
-                    tte = max(1, (exp_date - today).days)
-                except Exception:
+                if bid <= 0 or ask <= 0:
                     continue
 
                 if tte not in by_expiry:
@@ -378,17 +667,7 @@ class OptionsEngine:
     # INSTITUTIONAL SIGNAL 4: GEX-Aware Position Management
     # =========================================================================
     def _get_gex_regime(self, symbol: str = "SPY") -> dict:
-        """
-        Get Gamma Exposure regime for position management.
-
-        GEX REGIME IMPACT ON OPTIONS TRADING:
-        - Positive GEX (dealers long gamma): Market pins to strikes, rangebound.
-          → SELL options (theta collection), avoid directional bets
-        - Negative GEX (dealers short gamma): Market moves violently, trending.
-          → BUY options (gamma exposure), take directional bets
-
-        Returns regime info and position sizing adjustment factor.
-        """
+        """Get Gamma Exposure regime for position management."""
         try:
             from .gamma_positioning import GammaPositioning
         except ImportError:
@@ -400,14 +679,11 @@ class OptionsEngine:
             total_gex = gex_data.get("total_gex", 0)
             regime = gex_data.get("regime", "unknown")
 
-            # Position sizing adjustment
-            # Negative gamma → increase size (trending market, momentum works)
-            # Positive gamma → decrease size (rangebound, harder to profit)
             if regime == "negative_gamma":
-                size_factor = 1.2  # 20% larger positions in trending regime
-                confidence_boost = 2  # Extra confidence points
+                size_factor = 1.2
+                confidence_boost = 2
             elif regime == "positive_gamma":
-                size_factor = 0.8  # 20% smaller positions in rangebound regime
+                size_factor = 0.8
                 confidence_boost = -2
             else:
                 size_factor = 1.0
@@ -434,24 +710,11 @@ class OptionsEngine:
 
     def _compute_gex_adjusted_score(self, base_score: int, gex_regime: dict,
                                      option_type: str) -> int:
-        """
-        Adjust option score based on GEX regime.
-
-        Rules:
-        - Negative GEX + calls → boost score (buying gamma in trending market)
-        - Negative GEX + puts → boost score (buying gamma in trending market)
-        - Positive GEX + any long option → penalize (market pins, hard to profit)
-        - Positive GEX + selling → boost (theta collection in rangebound)
-        """
+        """Adjust option score based on GEX regime."""
         regime = gex_regime.get("regime", "unknown")
-        boost = gex_regime.get("confidence_boost", 0)
-
-        # For long options (which we're buying):
         if regime == "negative_gamma":
-            # Trending market → directional options work better
             return max(0, base_score + 3)
         elif regime == "positive_gamma":
-            # Rangebound → harder for long options to profit
             return max(0, base_score - 2)
         return base_score
 
@@ -461,8 +724,6 @@ class OptionsEngine:
     def scan_calls(self, symbol: str = "SPY", max_cost: float = 50.0,
                    max_dte: int = 21, min_delta: float = 0.10) -> list[dict]:
         """Scan for tradeable call options with institutional-grade scoring."""
-        from alpaca.data.requests import OptionChainRequest
-
         spy_price = self.get_spy_price()
         today = datetime.utcnow().date()
         max_expiry = today + timedelta(days=max_dte)
@@ -470,24 +731,40 @@ class OptionsEngine:
         # Get GEX regime once (cached per scan)
         gex_regime = self._get_gex_regime(symbol)
 
-        # Get chain
-        req = OptionChainRequest(
-            underlying_symbol=symbol,
-            expiration_date_gte=today + timedelta(days=2),
-            expiration_date_lte=max_expiry,
-        )
-        chain = self.opt_client.get_option_chain(req)
+        # Get option chain from Robinhood
+        instruments = self.rh.get_option_instruments(symbol, option_type="call")
+        if not instruments:
+            logger.warning("No call options found for %s", symbol)
+            return []
 
+        # Filter by expiration and get market data
         candidates = []
-        for sym, snap in chain.items():
-            if "C" not in sym:
+        for inst in instruments:
+            exp_str = inst.get("expiration_date", "")
+            if not exp_str:
                 continue
-            if not snap.latest_quote or not snap.greeks:
+            try:
+                exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            # Must be at least 2 days out and within max_dte
+            dte = (exp_date - today).days
+            if dte < 2 or dte > max_dte:
                 continue
 
-            q = snap.latest_quote
-            bid = float(q.bid_price or 0)
-            ask = float(q.ask_price or 0)
+            strike = float(inst.get("strike_price", 0))
+            if strike <= 0:
+                continue
+
+            # Get market data
+            try:
+                md = self.rh.get_option_market_data(inst["id"])
+            except Exception as e:
+                logger.debug("Market data failed for %s: %s", inst.get("id"), e)
+                continue
+
+            bid = float(md.get("bid_price") or 0)
+            ask = float(md.get("ask_price") or 0)
             if bid <= 0 or ask <= 0:
                 continue
 
@@ -496,30 +773,23 @@ class OptionsEngine:
             if cost <= 0 or cost > max_cost:
                 continue
 
-            delta = abs(float(snap.greeks.delta or 0))
-            gamma = float(snap.greeks.gamma or 0)
-            theta = float(snap.greeks.theta or 0)
-            vega = float(snap.greeks.vega or 0)
-            iv = float(snap.implied_volatility or 0)
+            greeks = md.get("greeks") or {}
+            delta = abs(float(greeks.get("delta") or 0))
+            gamma = float(greeks.get("gamma") or 0)
+            theta = float(greeks.get("theta") or 0)
+            vega = float(greeks.get("vega") or 0)
+            iv = float(md.get("implied_volatility") or greeks.get("implied_volatility") or 0)
 
             if delta < min_delta:
                 continue
 
-            try:
-                strike = float(sym.split("C")[1]) / 1000
-            except (ValueError, IndexError):
-                continue
-
-            dte = max(1, (max_expiry - today).days)
             spread_pct = ((ask - bid) / mid * 100) if mid > 0 else 999
             moneyness = (strike - spy_price) / spy_price * 100
 
             # =================================================================
-            # CORE SCORING (0-15 points — original factors)
+            # CORE SCORING (0-15 points)
             # =================================================================
             score = 0
-
-            # 1. Delta sweet spot (0.20-0.40 is ideal for leverage)
             if 0.20 <= delta <= 0.40:
                 score += 4
             elif 0.15 <= delta <= 0.50:
@@ -527,7 +797,6 @@ class OptionsEngine:
             elif delta >= 0.10:
                 score += 1
 
-            # 2. Affordability
             if cost <= 20:
                 score += 3
             elif cost <= 35:
@@ -535,7 +804,6 @@ class OptionsEngine:
             elif cost <= 50:
                 score += 1
 
-            # 3. Gamma (higher = more bang per $1 move)
             if gamma > 0.05:
                 score += 3
             elif gamma > 0.03:
@@ -543,13 +811,11 @@ class OptionsEngine:
             elif gamma > 0.01:
                 score += 1
 
-            # 4. Spread (tighter = better fills)
             if spread_pct < 5:
                 score += 3
             elif spread_pct < 10:
                 score += 1
 
-            # 5. DTE (5-14 days is sweet spot)
             if 5 <= dte <= 14:
                 score += 2
             elif 3 <= dte <= 21:
@@ -560,26 +826,22 @@ class OptionsEngine:
             # =================================================================
             inst_score = 0
 
-            # Signal 1: Vanna Flow (0-15)
             vanna_data = self._compute_vanna_flow_signal(
                 S=spy_price, K=strike, tau=dte, sigma=iv, option_type="call"
             )
             inst_score += vanna_data["vanna_flow_score"]
 
-            # Signal 2: Charm Decay Timing (0-15)
             charm_data = self._compute_charm_decay_signal(
                 S=spy_price, K=strike, tau=dte, sigma=iv, option_type="call"
             )
             inst_score += charm_data["charm_timing_score"]
 
-            # Signal 3: IV Surface Fair Value (0-10)
             iv_data = self._compute_iv_surface_signal(
                 symbol=symbol, strike=strike, market_iv=iv,
                 spot=spy_price, dte=dte, option_type="call"
             )
             inst_score += iv_data["iv_surface_score"]
 
-            # Signal 4: GEX Regime Adjustment
             gex_adjusted = self._compute_gex_adjusted_score(
                 inst_score, gex_regime, "call"
             )
@@ -588,7 +850,8 @@ class OptionsEngine:
             total_score = score + inst_score
 
             candidates.append({
-                "symbol": sym,
+                "symbol": inst.get("symbol", ""),
+                "option_id": inst.get("id", ""),
                 "underlying": symbol,
                 "type": "call",
                 "strike": strike,
@@ -628,32 +891,43 @@ class OptionsEngine:
     def scan_puts(self, symbol: str = "SPY", max_cost: float = 50.0,
                   max_dte: int = 21, min_delta: float = 0.10) -> list[dict]:
         """Scan for tradeable put options with institutional-grade scoring."""
-        from alpaca.data.requests import OptionChainRequest
-
         spy_price = self.get_spy_price()
         today = datetime.utcnow().date()
         max_expiry = today + timedelta(days=max_dte)
 
-        # Get GEX regime once
         gex_regime = self._get_gex_regime(symbol)
 
-        req = OptionChainRequest(
-            underlying_symbol=symbol,
-            expiration_date_gte=today + timedelta(days=2),
-            expiration_date_lte=max_expiry,
-        )
-        chain = self.opt_client.get_option_chain(req)
+        # Get option chain from Robinhood
+        instruments = self.rh.get_option_instruments(symbol, option_type="put")
+        if not instruments:
+            logger.warning("No put options found for %s", symbol)
+            return []
 
         candidates = []
-        for sym, snap in chain.items():
-            if "P" not in sym:
+        for inst in instruments:
+            exp_str = inst.get("expiration_date", "")
+            if not exp_str:
                 continue
-            if not snap.latest_quote or not snap.greeks:
+            try:
+                exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            dte = (exp_date - today).days
+            if dte < 2 or dte > max_dte:
                 continue
 
-            q = snap.latest_quote
-            bid = float(q.bid_price or 0)
-            ask = float(q.ask_price or 0)
+            strike = float(inst.get("strike_price", 0))
+            if strike <= 0:
+                continue
+
+            try:
+                md = self.rh.get_option_market_data(inst["id"])
+            except Exception as e:
+                logger.debug("Market data failed for %s: %s", inst.get("id"), e)
+                continue
+
+            bid = float(md.get("bid_price") or 0)
+            ask = float(md.get("ask_price") or 0)
             if bid <= 0 or ask <= 0:
                 continue
 
@@ -662,21 +936,16 @@ class OptionsEngine:
             if cost <= 0 or cost > max_cost:
                 continue
 
-            delta = abs(float(snap.greeks.delta or 0))
+            greeks = md.get("greeks") or {}
+            delta = abs(float(greeks.get("delta") or 0))
             if delta < min_delta:
                 continue
 
-            try:
-                strike = float(sym.split("P")[1]) / 1000
-            except (ValueError, IndexError):
-                continue
-
-            gamma = float(snap.greeks.gamma or 0)
-            theta = float(snap.greeks.theta or 0)
-            vega = float(snap.greeks.vega or 0)
-            iv = float(snap.implied_volatility or 0)
+            gamma = float(greeks.get("gamma") or 0)
+            theta = float(greeks.get("theta") or 0)
+            vega = float(greeks.get("vega") or 0)
+            iv = float(md.get("implied_volatility") or greeks.get("implied_volatility") or 0)
             spread_pct = ((ask - bid) / mid * 100) if mid > 0 else 999
-            dte = max(1, (max_expiry - today).days)
 
             # =================================================================
             # CORE SCORING (0-15)
@@ -704,34 +973,25 @@ class OptionsEngine:
             # =================================================================
             inst_score = 0
 
-            # Signal 1: Vanna Flow (0-15)
-            # For puts: negative vanna + IV declining = bullish vanna flow
-            # This means: if we're BUYING puts in a vanna-flow environment,
-            # we're against the institutional flow → lower score
             vanna_data = self._compute_vanna_flow_signal(
                 S=spy_price, K=strike, tau=dte, sigma=iv, option_type="put"
             )
-            # For puts, bullish vanna flow means the market is likely rallying
-            # → reduce score for put buying, boost for put selling
             if vanna_data["vanna_flow_direction"] == "bullish":
                 inst_score += max(0, vanna_data["vanna_flow_score"] - 5)
             else:
                 inst_score += vanna_data["vanna_flow_score"]
 
-            # Signal 2: Charm Decay Timing (0-15)
             charm_data = self._compute_charm_decay_signal(
                 S=spy_price, K=strike, tau=dte, sigma=iv, option_type="put"
             )
             inst_score += charm_data["charm_timing_score"]
 
-            # Signal 3: IV Surface Fair Value (0-10)
             iv_data = self._compute_iv_surface_signal(
                 symbol=symbol, strike=strike, market_iv=iv,
                 spot=spy_price, dte=dte, option_type="put"
             )
             inst_score += iv_data["iv_surface_score"]
 
-            # Signal 4: GEX Regime Adjustment
             gex_adjusted = self._compute_gex_adjusted_score(
                 inst_score, gex_regime, "put"
             )
@@ -740,7 +1000,8 @@ class OptionsEngine:
             total_score = score + inst_score
 
             candidates.append({
-                "symbol": sym,
+                "symbol": inst.get("symbol", ""),
+                "option_id": inst.get("id", ""),
                 "underlying": symbol,
                 "type": "put",
                 "strike": strike,
@@ -780,83 +1041,50 @@ class OptionsEngine:
     def check_vanna_exit_signal(
         self, position: dict, current_iv: float, entry_iv: float,
     ) -> dict:
-        """
-        Check if vanna flow suggests exiting a position.
-
-        VANNA FLOW EXIT RULES:
-        1. If we're long calls and IV has dropped significantly:
-           - Vanna flow = dealers buying (unwinding put hedges)
-           - This is BULLISH for the market → our calls should be profitable
-           - But: if IV keeps dropping, our vega exposure loses money
-           - EXIT when: IV has dropped >20% from entry OR vanna flow is exhausted
-
-        2. If we're long puts and IV has dropped:
-           - Vanna flow is bullish → our puts are losing on both delta AND vega
-           - EXIT immediately if IV drops >10% from entry
-
-        3. If IV is RISING:
-           - For calls: vega gains, but vanna flow is bearish (dealers selling)
-           - For puts: vega gains AND vanna flow is bullish (dealers buying puts)
-           - HOLD puts, be cautious with calls
-
-        Returns: exit signal with reason and urgency.
-        """
+        """Check if vanna flow suggests exiting a position."""
         if current_iv <= 0 or entry_iv <= 0:
             return {"exit": False, "reason": "IV data unavailable"}
 
         iv_change_pct = (current_iv - entry_iv) / entry_iv
         option_type = position.get("type", "call")
+        vanna_exhausted = abs(iv_change_pct) < 0.03
 
-        # Vanna flow is exhausted when IV stabilizes or reverses
-        vanna_exhausted = abs(iv_change_pct) < 0.03  # <3% IV change = quiet
-
-        # EXIT RULES
         if option_type == "call":
-            # Long calls: exit if IV drops too much (vega losses exceed delta gains)
             if iv_change_pct < -0.15:
                 return {
-                    "exit": True,
-                    "urgency": "high",
+                    "exit": True, "urgency": "high",
                     "reason": f"IV dropped {iv_change_pct*100:.1f}% from entry → vega losses, vanna flow may be exhausted",
                     "signal": "vanna_iv_crush",
                 }
             elif iv_change_pct < -0.10 and vanna_exhausted:
                 return {
-                    "exit": True,
-                    "urgency": "medium",
+                    "exit": True, "urgency": "medium",
                     "reason": f"IV down {iv_change_pct*100:.1f}% and stabilizing → vanna flow exhaustion",
                     "signal": "vanna_flow_exhausted",
                 }
-            # If IV is rising, vanna flow is bearish for calls (dealers selling)
             elif iv_change_pct > 0.20:
                 return {
-                    "exit": False,
-                    "urgency": "watch",
+                    "exit": False, "urgency": "watch",
                     "reason": f"IV up {iv_change_pct*100:.1f}% → vega gains but vanna flow bearish, monitor closely",
                     "signal": "vanna_bearish_watch",
                 }
 
         elif option_type == "put":
-            # Long puts: exit if IV drops (puts lose on vega AND vanna flow bullish)
             if iv_change_pct < -0.08:
                 return {
-                    "exit": True,
-                    "urgency": "high",
+                    "exit": True, "urgency": "high",
                     "reason": f"IV dropped {iv_change_pct*100:.1f}% → vega loss + bullish vanna flow = double negative for puts",
                     "signal": "vanna_put_catastrophic",
                 }
-            # If IV rising, vanna flow is bullish AND we have vega gains → hold
             elif iv_change_pct > 0.10:
                 return {
-                    "exit": False,
-                    "urgency": "hold",
+                    "exit": False, "urgency": "hold",
                     "reason": f"IV up {iv_change_pct*100:.1f}% → vega gains + bullish vanna flow supports puts",
                     "signal": "vanna_put_favorable",
                 }
 
         return {
-            "exit": False,
-            "urgency": "hold",
+            "exit": False, "urgency": "hold",
             "reason": f"Vanna flow neutral (IV change: {iv_change_pct*100:.1f}%)",
             "signal": "vanna_neutral",
         }
@@ -866,25 +1094,8 @@ class OptionsEngine:
     # =========================================================================
     def get_optimal_entry_dte(self, symbol: str = "SPY",
                                option_type: str = "call") -> dict:
-        """
-        Determine optimal DTE for entry based on charm decay curves.
-
-        CHARM ENTRY TIMING:
-        - Charm is highest (most delta decay) for ATM options at 1-7 DTE
-        - But entering too close to expiry = high theta burn
-        - Sweet spot: when charm_per_day is maximized relative to theta_per_day
-        - This gives us the best "delta acceleration" per dollar of theta paid
-
-        For 0DTE specifically:
-        - Charm creates a "delta magnet" effect
-        - ATM calls gain delta faster as expiry approaches
-        - This is exploitable for 0DTE directional trades
-
-        Returns optimal DTE and timing rationale.
-        """
+        """Determine optimal DTE for entry based on charm decay curves."""
         spot = self.get_spy_price()
-
-        # Test different DTEs to find optimal charm/theta ratio
         best_dte = 7
         best_ratio = 0
 
@@ -897,15 +1108,13 @@ class OptionsEngine:
 
         for test_dte in [1, 2, 3, 5, 7, 10, 14, 21, 30]:
             tau_years = test_dte / 365.0
-            # Use ATM strike and typical IV
-            iv = 0.20 if test_dte > 7 else 0.25  # IV typically higher for short-dated
+            iv = 0.20 if test_dte > 7 else 0.25
 
             try:
                 hog = compute_hol_greeks(
                     S=spot, K=spot, t=tau_years, r=0.05,
                     sigma=iv, q=0.0, flag=flag
                 )
-                # Charm/theta ratio: how much delta acceleration per dollar of theta
                 if hog.charm != 0:
                     ratio = abs(hog.charm) / max(abs(hog.veta), 0.001)
                     if ratio > best_ratio:
@@ -931,7 +1140,6 @@ class OptionsEngine:
         """Find the best options trade across all strategies with GEX awareness."""
         cash = self._get_cash()
 
-        # Always scan up to $50 — we want to know what's available
         max_scan_cost = 50.0
 
         if direction == "bullish":
@@ -944,17 +1152,13 @@ class OptionsEngine:
         if not candidates:
             return {"action": "none", "reason": f"No viable {direction} options found"}
 
-        # GEX regime check: in positive gamma regime, prefer selling over buying
         gex = self._get_gex_regime()
         if gex["regime"] == "positive_gamma" and direction == "bullish":
-            # In rangebound market, buying calls is less effective
-            # Still proceed but note reduced conviction
             for c in candidates:
                 c["score"] = max(0, c["score"] - 3)
                 c["gex_warning"] = "Positive GEX → rangebound expected, directional bet risky"
             candidates.sort(key=lambda x: x["score"], reverse=True)
 
-        # Find best affordable option
         affordable = [c for c in candidates if c["cost"] <= cash]
         unaffordable = [c for c in candidates if c["cost"] > cash]
 
@@ -984,18 +1188,21 @@ class OptionsEngine:
             }
 
     def execute_trade(self, candidate: dict) -> dict:
-        """Execute an options trade."""
-        from alpaca.trading.requests import MarketOrderRequest
-        from alpaca.trading.enums import OrderSide, TimeInForce
-
+        """Execute an options trade via Robinhood MCP."""
         try:
-            order = self.trading_client.submit_order(
-                MarketOrderRequest(
-                    symbol=candidate["symbol"],
-                    qty=1,
-                    side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY,
-                )
+            # Robinhood requires limit orders for options
+            # Use the ask price as limit price for buys (aggressive fill)
+            limit_price = candidate.get("ask", candidate.get("mid", 0))
+            if limit_price <= 0:
+                limit_price = candidate.get("mid", 1.0)
+
+            order = self.rh.place_option_order(
+                symbol=candidate["underlying"],
+                option_id=candidate.get("option_id", ""),
+                side="buy",
+                quantity=1,
+                price=limit_price,
+                time_in_force="gfd",
             )
 
             result = {
@@ -1007,8 +1214,8 @@ class OptionsEngine:
                 "cost": candidate["cost"],
                 "delta": candidate["delta"],
                 "score": candidate["score"],
-                "order_id": str(order.id),
-                "status": str(order.status),
+                "order_id": str(order.get("id", "")),
+                "status": str(order.get("state", order.get("status", "submitted"))),
                 # Log institutional signals
                 "vanna": candidate.get("vanna", 0),
                 "charm": candidate.get("charm", 0),
@@ -1021,6 +1228,7 @@ class OptionsEngine:
                 "timestamp": datetime.utcnow().isoformat(),
                 "action": "BUY_OPTION",
                 "symbol": candidate["symbol"],
+                "option_id": candidate.get("option_id", ""),
                 "underlying": candidate["underlying"],
                 "type": candidate["type"],
                 "strike": candidate["strike"],
@@ -1029,8 +1237,8 @@ class OptionsEngine:
                 "gamma": candidate.get("gamma", 0),
                 "iv": candidate.get("iv", 0),
                 "score": candidate["score"],
-                "order_id": str(order.id),
-                "strategy": "options_engine_v5",
+                "order_id": str(order.get("id", "")),
+                "strategy": "options_engine_v5_robinhood",
                 # Institutional signals
                 "vanna": candidate.get("vanna", 0),
                 "charm": candidate.get("charm", 0),
@@ -1039,6 +1247,7 @@ class OptionsEngine:
                 "iv_surface_score": candidate.get("iv_surface_score", 0),
                 "gex_regime": candidate.get("gex_regime", "unknown"),
                 "entry_iv": candidate.get("iv", 0),
+                "broker": "robinhood",
             }
             with open("/opt/hermes-trader/data/journals/paper_orders.jsonl", "a") as f:
                 f.write(json.dumps(entry) + "\n")
@@ -1050,7 +1259,6 @@ class OptionsEngine:
 
     def auto_trade(self) -> dict:
         """Fully autonomous options trade with institutional-grade signals."""
-        # Determine direction from market regime
         direction = "bullish"
         try:
             from .market_regime import detect_regime
@@ -1060,25 +1268,18 @@ class OptionsEngine:
         except Exception:
             pass
 
-        # GEX regime check: might override direction
         gex = self._get_gex_regime()
         if gex["regime"] == "positive_gamma" and direction == "bullish":
-            # In positive gamma (rangebound), directional bets less effective
-            # Still trade but with reduced conviction
             pass
 
-        # Find best trade
         result = self.find_best_trade(direction)
 
         if result.get("action") == "trade":
             candidate = result["candidate"]
             execution = self.execute_trade(candidate)
             result["execution"] = execution
-
-            # Store entry IV for exit monitoring
             result["entry_iv"] = candidate.get("iv", 0)
 
-        # Also scan the other direction for hedging
         other_dir = "bearish" if direction == "bullish" else "bullish"
         other_candidates = (
             self.scan_calls(max_cost=20.0) if other_dir == "bullish"
@@ -1086,7 +1287,6 @@ class OptionsEngine:
         )
         result["hedge_candidates"] = other_candidates[:3] if other_candidates else []
 
-        # Add institutional signal summary
         result["institutional_signals"] = {
             "gex_regime": gex["regime"],
             "gex_flip_strike": gex.get("flip_strike"),
@@ -1096,10 +1296,9 @@ class OptionsEngine:
         return result
 
     def _get_cash(self) -> float:
-        """Get available cash."""
+        """Get available cash from Robinhood."""
         try:
-            acct = self.trading_client.get_account()
-            return float(acct.cash)
+            return self.rh.get_cash()
         except Exception:
             return 0.0
 
@@ -1133,30 +1332,42 @@ def get_vanna_flow_analysis(symbol: str = "SPY", spot: float = None) -> dict:
         spot = engine.get_spy_price()
 
     try:
-        from alpaca.data.requests import OptionChainRequest
         today = datetime.utcnow().date()
-        req = OptionChainRequest(
-            underlying_symbol=symbol,
-            expiration_date_gte=today,
-            expiration_date_lte=today + timedelta(days=7),
-        )
-        chain = engine.opt_client.get_option_chain(req)
+
+        # Get options with market data from Robinhood (7-day window)
+        lte = today + timedelta(days=7)
+        instruments = engine.rh.get_option_instruments(symbol)
+        if not instruments:
+            return {"error": "No options found", "flow_signal": "UNAVAILABLE"}
 
         total_put_vanna = 0
         total_call_vanna = 0
         vanna_by_strike = {}
 
-        for sym, snap in chain.items():
-            if not snap.latest_quote or not snap.greeks:
+        for inst in instruments:
+            exp_str = inst.get("expiration_date", "")
+            if not exp_str:
+                continue
+            try:
+                exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if exp_date > lte:
                 continue
 
-            is_call = "C" in sym
+            is_call = inst.get("type") == "call"
+            strike = float(inst.get("strike_price", 0))
+            if strike <= 0:
+                continue
+
+            # Get market data for IV
             try:
-                strike = float(sym.split("C" if is_call else "P")[1]) / 1000
+                md = engine.rh.get_option_market_data(inst["id"])
+                greeks = md.get("greeks") or {}
+                iv = float(md.get("implied_volatility") or greeks.get("implied_volatility") or 0)
             except Exception:
                 continue
 
-            iv = float(snap.implied_volatility or 0)
             if iv <= 0:
                 continue
 
@@ -1182,7 +1393,6 @@ def get_vanna_flow_analysis(symbol: str = "SPY", spot: float = None) -> dict:
 
         net_vanna = total_call_vanna + total_put_vanna
 
-        # Interpret vanna flow
         if net_vanna < -0.005:
             flow_signal = "BULLISH (net negative vanna → dealers must buy as IV drops)"
         elif net_vanna > 0.005:
@@ -1209,7 +1419,7 @@ if __name__ == "__main__":
     load_dotenv("/opt/hermes-trader/.env")
 
     engine = OptionsEngine()
-    print("=== OPTIONS ENGINE v5 — INSTITUTIONAL GRADE ===")
+    print("=== OPTIONS ENGINE v5 — INSTITUTIONAL GRADE (Robinhood MCP) ===")
 
     # Vanna flow analysis
     print("\n--- Vanna Flow Analysis ---")

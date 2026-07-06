@@ -165,17 +165,10 @@ class Config:
     phase_2_max_positions = property(lambda s: int(_env_float("PHASE_2_MAX_POSITIONS", constants.PHASE_2_MAX_POSITIONS)))
     phase_3_max_positions = property(lambda s: int(_env_float("PHASE_3_MAX_POSITIONS", constants.PHASE_3_MAX_POSITIONS)))
 
-    # === Alpaca ===
-    alpaca_api_key = property(lambda s: _env_str("ALPACA_API_KEY", ""))
-    alpaca_secret_key = property(lambda s: _env_str("ALPACA_SECRET_KEY", ""))
-    alpaca_paper = property(lambda s: _env_bool("ALPACA_PAPER", True))
-
-    @property
-    def alpaca_base_url(self) -> str:
-        url = _env_str("ALPACA_BASE_URL", "")
-        if url:
-            return url
-        return "https://paper-api.alpaca.markets" if self.alpaca_paper else "https://api.alpaca.markets"
+    # === Robinhood MCP ===
+    robinhood_account_number = property(lambda s: _env_str("ROBINHOOD_ACCOUNT_NUMBER", "924058324"))
+    robinhood_mcp_endpoint = property(lambda s: _env_str("ROBINHOOD_MCP_ENDPOINT", "https://agent.robinhood.com/mcp/trading"))
+    robinhood_token_path = property(lambda s: Path(_env_str("ROBINHOOD_TOKEN_PATH", str(Path.home() / ".hermes" / "mcp-tokens" / "robinhood.json"))))
 
     # === Paths ===
     project_root = property(lambda s: Path(_env_str("PROJECT_ROOT", "/opt/hermes-trader")))
@@ -220,7 +213,6 @@ class Config:
         if hasattr(self, '_live_unlocked'):
             return self._live_unlocked
         return all([
-            not self.alpaca_paper,
             self.enable_live_trading,
             self.live_autonomy_mode == "TINY_LIVE_AUTONOMOUS",
             self.live_confirmation_phrase == "I_ACCEPT_THAT_THIS_20_DOLLAR_EXPERIMENT_CAN_LOSE_MONEY",
@@ -237,9 +229,9 @@ class Config:
             "enable_live_trading": self.enable_live_trading,
             "live_autonomy_mode": self.live_autonomy_mode,
             "live_unlock_confirmed": bool(self.live_confirmation_phrase != "DISABLED"),
-            "alpaca_paper": self.alpaca_paper,
-            "alpaca_api_key_set": bool(self.alpaca_api_key),
-            "alpaca_api_key": "***REDACTED***" if self.alpaca_api_key else "",
+            "robinhood_account_number": self.robinhood_account_number,
+            "robinhood_mcp_endpoint": self.robinhood_mcp_endpoint,
+            "robinhood_token_exists": self.robinhood_token_path.exists(),
             "kill_switch_active": self.is_kill_switch_active,
             "vibe_trading_enabled": self.vibe_trading_enabled,
             "tradingagents_enabled": self.tradingagents_enabled,

@@ -21,7 +21,7 @@ from .models.trade_decision import DecisionLog, PolicyResult
 from .models.order_request import OrderRequest
 from .policy.risk_gate import PolicyEngine, policy_engine
 from .policy.scoring import ScoringEngine
-from .integrations.alpaca_broker import PaperBrokerAdapter
+from .integrations.robinhood_broker import RobinhoodBrokerAdapter
 from .monitoring.position_monitor import PositionMonitor
 from .research.agents_client import TradingAgentsClient
 from .research.vibe_client import VibeTradingClient
@@ -33,7 +33,7 @@ class DailyWorkflow:
     """Execute one daily cycle: research → score → policy → journal → report."""
 
     def __init__(self):
-        self.broker = PaperBrokerAdapter()
+        self.broker = RobinhoodBrokerAdapter()
         self.policy = policy_engine
         self.scoring = ScoringEngine()
         self.vibe = VibeTradingClient()

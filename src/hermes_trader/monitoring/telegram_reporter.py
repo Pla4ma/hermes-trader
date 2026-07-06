@@ -86,7 +86,7 @@ def format_kill_switch_alert() -> str:
 
 
 def format_live_unlock_confirmation() -> str:
-    return "🔴 **LIVE TRADING UNLOCKED** 🔴\n\nAll 4 conditions met:\n• ALPACA_PAPER=false\n• ENABLE_LIVE_TRADING=true\n• LIVE_AUTONOMY_MODE=TINY_LIVE_AUTONOMOUS\n• Confirmation phrase set\n\n⚠️ This $20 experiment CAN lose money."
+    return "🔴 **LIVE TRADING UNLOCKED** 🔴\n\nAll 4 conditions met:\n• ROBINHOOD_MCP=true\n• ENABLE_LIVE_TRADING=true\n• LIVE_AUTONOMY_MODE=TINY_LIVE_AUTONOMOUS\n• Confirmation phrase set\n\n⚠️ This $20 experiment CAN lose money."
 
 
 def format_error_alert(error: str) -> str:

@@ -9,7 +9,7 @@ class MlegLeg(BaseModel):
     """A single leg in a multi-leg (mleg) order.
 
     Each leg specifies its own symbol, side, qty, and position intent
-    (buy_to_open, sell_to_close, etc.) for Alpaca's mleg API.
+    (buy_to_open, sell_to_close, etc.) for Robinhood's mleg API.
     """
     symbol: str
     side: Literal["buy", "sell"]

@@ -4,22 +4,35 @@ import json
 import os
 from datetime import datetime
 
+from .integrations.robinhood_broker import (
+    ROBINHOOD_ACCOUNT,
+    _parse_orders_list,
+    _parse_positions,
+    _safe_float,
+    robinhood_mcp_call,
+)
+
 
 def generate_daily_summary() -> str:
     """Generate a comprehensive daily trading summary."""
     try:
-        import alpaca_trade_api as tradeapi
-        api_key = os.getenv("ALPACA_API_KEY", "")
-        secret_key = os.getenv("ALPACA_SECRET_KEY", "")
-        base_url = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
-        api = tradeapi.REST(api_key, secret_key, base_url)
+        account_data = robinhood_mcp_call("get_accounts", {})
+        positions_data = robinhood_mcp_call("get_equity_positions", {
+            "account_number": ROBINHOOD_ACCOUNT,
+        })
+        orders_data = robinhood_mcp_call("get_equity_orders", {
+            "account_number": ROBINHOOD_ACCOUNT,
+        })
 
-        acct = api.get_account()
-        positions = api.list_positions()
-        orders = api.list_orders(status="all", limit=50)
+        equity = _safe_float(account_data, "equity", "portfolio_value", "account_value")
+        cash = _safe_float(account_data, "cash", "cash_balance", "available_cash")
+        daytrade_count = int(_safe_float(account_data, "daytrade_count", "day_trade_count", default=0))
 
-        total_pnl = sum(float(p.unrealized_pl) for p in positions)
-        filled_orders = [o for o in orders if o.status == "filled"]
+        positions = _parse_positions(positions_data)
+        orders = _parse_orders_list(orders_data)
+
+        total_pnl = sum(p.unrealized_pl for p in positions)
+        filled_orders = [o for o in orders if o.get("status") == "filled"]
 
         lines = [
             "# 📊 Daily Trading Summary",
@@ -28,10 +41,10 @@ def generate_daily_summary() -> str:
             "## Account",
             f"| Metric | Value |",
             f"|---|---|",
-            f"| Cash | ${acct.cash} |",
-            f"| Equity | ${acct.portfolio_value} |",
+            f"| Cash | ${cash:.2f} |",
+            f"| Equity | ${equity:.2f} |",
             f"| P&L | ${total_pnl:.3f} |",
-            f"| Day Trades | {acct.daytrade_count} |",
+            f"| Day Trades | {daytrade_count} |",
             "",
             "## Open Positions",
             "| Symbol | Entry | Current | P&L | P&L% |",
@@ -39,10 +52,12 @@ def generate_daily_summary() -> str:
         ]
 
         for p in positions:
-            pnl = float(p.unrealized_pl)
-            pnl_pct = float(p.unrealized_plpc) * 100
+            pnl = p.unrealized_pl
+            pnl_pct = p.unrealized_plpc * 100
             emoji = "🟢" if pnl >= 0 else "🔴"
-            lines.append(f"| {p.symbol} | ${p.avg_entry_price} | ${p.current_price} | {emoji} ${pnl:.3f} | {pnl_pct:+.2f}% |")
+            entry = p.cost_basis / p.qty if p.qty > 0 else 0
+            current = p.market_value / p.qty if p.qty > 0 else 0
+            lines.append(f"| {p.symbol} | ${entry:.2f} | ${current:.2f} | {emoji} ${pnl:.3f} | {pnl_pct:+.2f}% |")
 
         lines.extend([
             "",
@@ -52,21 +67,22 @@ def generate_daily_summary() -> str:
         ])
 
         for o in filled_orders:
-            fill_price = o.filled_avg_price or "N/A"
-            fill_qty = o.filled_qty or "0"
-            lines.append(f"| {str(o.filled_at)[:19] if o.filled_at else 'N/A'} | {o.symbol} | {o.side} | {fill_qty} | ${fill_price} |")
+            fill_price = o.get("filled_avg_price", "N/A") or "N/A"
+            fill_qty = o.get("filled_qty", "0") or "0"
+            fill_time = str(o.get("submitted_at", "N/A"))[:19] if o.get("submitted_at") else "N/A"
+            lines.append(f"| {fill_time} | {o['symbol']} | {o['side']} | {fill_qty} | ${fill_price} |")
 
         # Open exit orders
-        open_orders = [o for o in orders if o.status in ("new", "accepted")]
+        open_orders = [o for o in orders if o.get("status") in ("new", "accepted", "open", "partially_filled")]
         if open_orders:
             lines.extend([
                 "",
                 "## Exit Orders",
-                "| Symbol | Side | Type | Limit | Stop |",
-                "|---|---|---|---|---|",
+                "| Symbol | Side | Type | Status |",
+                "|---|---|---|---|",
             ])
             for o in open_orders:
-                lines.append(f"| {o.symbol} | {o.side} | {o.order_type} | ${o.limit_price or 'N/A'} | ${o.stop_price or 'N/A'} |")
+                lines.append(f"| {o['symbol']} | {o['side']} | {o.get('order_type', 'N/A')} | {o.get('status', 'N/A')} |")
 
         # Journal analysis
         journal_path = "/opt/hermes-trader/data/journals/paper_orders.jsonl"
@@ -83,7 +99,7 @@ def generate_daily_summary() -> str:
         lines.extend([
             "",
             "## System Status",
-            "- ✅ Alpaca API connected",
+            "- ✅ Robinhood MCP connected",
             "- ✅ Real market data (yfinance)",
             "- ✅ Auto-trading engine active",
             "- ✅ Trailing stops enabled",

@@ -51,59 +51,88 @@ class GammaPositioning:
     """Institutional-grade gamma dynamics and options positioning."""
 
     def __init__(self):
-        self.api_key = os.getenv("ALPACA_API_KEY", "")
-        self.secret_key = os.getenv("ALPACA_SECRET_KEY", "")
-        self.base_url = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
-        self._opt_client = None
-        self._trading_client = None
-
-    @property
-    def opt_client(self):
-        if self._opt_client is None:
-            from alpaca.data.historical import OptionHistoricalDataClient
-            self._opt_client = OptionHistoricalDataClient(self.api_key, self.secret_key)
-        return self._opt_client
-
-    @property
-    def trading_client(self):
-        if self._trading_client is None:
-            from alpaca.trading.client import TradingClient
-            self._trading_client = TradingClient(self.api_key, self.secret_key)
-        return self._trading_client
+        self._opt_chain_cache = {}
 
     def get_spot_price(self, symbol: str = "SPY") -> float:
         import yfinance as yf
         return yf.Ticker(symbol).fast_info.get("lastPrice", 0)
 
+    def _fetch_option_chain(self, symbol: str, max_dte: int) -> list:
+        """Fetch option chain via yfinance, computing Greeks from IV.
+
+        Returns list of dicts with keys: symbol, strike, is_call,
+        bid, ask, volume, open_interest, gamma, iv.
+        """
+        import yfinance as yf
+        from datetime import date
+        from .greeks_engine import BlackScholesGreeks as BSG
+
+        ticker = yf.Ticker(symbol)
+        spot = self.get_spot_price(symbol)
+        today = date.today()
+        chain = []
+
+        for exp_str in ticker.options:
+            try:
+                exp_date = date.fromisoformat(exp_str)
+                dte = (exp_date - today).days
+            except Exception:
+                continue
+            if dte > max_dte or dte < 1:
+                continue
+
+            opt = ticker.option_chain(exp_str)
+            tau = max(dte, 1) / 365.0
+            r = 0.052  # risk-free rate
+
+            for side_df, is_call in [(opt.calls, True), (opt.puts, False)]:
+                for _, row in side_df.iterrows():
+                    iv = float(row.get("impliedVolatility", 0))
+                    bid = float(row.get("bid", 0))
+                    ask = float(row.get("ask", 0))
+                    if bid <= 0 or ask <= 0:
+                        continue
+
+                    strike = float(row["strike"])
+                    option_type = "call" if is_call else "put"
+                    gamma = 0.0
+                    if iv > 0 and spot > 0:
+                        try:
+                            gamma = float(BSG.gamma(spot, strike, r, 0.0, iv, tau))
+                        except Exception:
+                            gamma = 0.0
+
+                    chain.append({
+                        "symbol": row.get("contractSymbol", ""),
+                        "strike": strike,
+                        "is_call": is_call,
+                        "bid": bid,
+                        "ask": ask,
+                        "volume": int(row.get("volume", 0) or 0),
+                        "open_interest": int(row.get("openInterest", 0) or 0),
+                        "gamma": gamma,
+                        "iv": iv,
+                    })
+
+        return chain
+
     def calculate_gex(self, symbol: str = "SPY", max_dte: int = 7) -> dict:
         """Calculate Gamma Exposure (GEX) for each strike."""
-        from alpaca.data.requests import OptionChainRequest
-        from datetime import date
-        today = date.today()
-        req = OptionChainRequest(
-            underlying_symbol=symbol,
-            expiration_date_gte=today,
-            expiration_date_lte=today + timedelta(days=max_dte),
-        )
-        chain = self.opt_client.get_option_chain(req)
+        chain = self._fetch_option_chain(symbol, max_dte)
         spot = self.get_spot_price(symbol)
 
         gex_by_strike = {}
         total_gex = 0
 
-        for sym, snap in chain.items():
-            if not snap.greeks or not snap.latest_quote:
-                continue
-            gamma = float(snap.greeks.gamma or 0)
-            is_call = "C" in sym
-            try:
-                strike = float(sym.split("C" if is_call else "P")[1]) / 1000
-            except Exception:
-                continue
+        for opt in chain:
+            gamma = opt["gamma"]
+            is_call = opt["is_call"]
+            strike = opt["strike"]
 
             # GEX = Gamma × OI × Spot² × 0.01
             # Simplified: use gamma × spot² × 100
-            gex = gamma * spot * spot * 100 * (1 if is_call else -1)
+            oi = opt["open_interest"]
+            gex = gamma * spot * spot * oi * 0.01 * (1 if is_call else -1)
             total_gex += gex
 
             if strike not in gex_by_strike:
@@ -146,32 +175,19 @@ class GammaPositioning:
 
     def detect_put_call_walls(self, symbol: str = "SPY", max_dte: int = 7) -> dict:
         """Detect put and call walls (strikes with massive OI)."""
-        from alpaca.data.requests import OptionChainRequest
-        from datetime import date
-        today = date.today()
-        req = OptionChainRequest(
-            underlying_symbol=symbol,
-            expiration_date_gte=today,
-            expiration_date_lte=today + timedelta(days=max_dte),
-        )
-        chain = self.opt_client.get_option_chain(req)
+        chain = self._fetch_option_chain(symbol, max_dte)
         spot = self.get_spot_price(symbol)
 
         put_oi = {}
         call_oi = {}
 
-        for sym, snap in chain.items():
-            if not snap.latest_quote:
-                continue
-            try:
-                strike = float(sym.split("C" if "C" in sym else "P")[1]) / 1000
-                oi = 0  # OI not available in snapshot
-                if "C" in sym:
-                    call_oi[strike] = call_oi.get(strike, 0) + oi
-                else:
-                    put_oi[strike] = put_oi.get(strike, 0) + oi
-            except Exception:
-                continue
+        for opt in chain:
+            strike = opt["strike"]
+            oi = opt["open_interest"]
+            if opt["is_call"]:
+                call_oi[strike] = call_oi.get(strike, 0) + oi
+            else:
+                put_oi[strike] = put_oi.get(strike, 0) + oi
 
         # Find walls (highest OI)
         put_walls = []
@@ -208,33 +224,20 @@ class GammaPositioning:
 
     def calculate_max_pain(self, symbol: str = "SPY", max_dte: int = 7) -> dict:
         """Calculate max pain — strike where most options expire worthless."""
-        from alpaca.data.requests import OptionChainRequest
-        from datetime import date
-        today = date.today()
-        req = OptionChainRequest(
-            underlying_symbol=symbol,
-            expiration_date_gte=today,
-            expiration_date_lte=today + timedelta(days=max_dte),
-        )
-        chain = self.opt_client.get_option_chain(req)
+        chain = self._fetch_option_chain(symbol, max_dte)
         spot = self.get_spot_price(symbol)
 
         strikes = {}
-        for sym, snap in chain.items():
-            if not snap.latest_quote:
-                continue
-            try:
-                strike = float(sym.split("C" if "C" in sym else "P")[1]) / 1000
-                oi = 0  # OI not available in snapshot
-                is_call = "C" in sym
-                if strike not in strikes:
-                    strikes[strike] = {"call_oi": 0, "put_oi": 0}
-                if is_call:
-                    strikes[strike]["call_oi"] += oi
-                else:
-                    strikes[strike]["put_oi"] += oi
-            except Exception:
-                continue
+        for opt in chain:
+            strike = opt["strike"]
+            is_call = opt["is_call"]
+            oi = opt["open_interest"]
+            if strike not in strikes:
+                strikes[strike] = {"call_oi": 0, "put_oi": 0}
+            if is_call:
+                strikes[strike]["call_oi"] += oi
+            else:
+                strikes[strike]["put_oi"] += oi
 
         # Calculate pain for each strike
         min_pain = float('inf')
@@ -268,30 +271,20 @@ class GammaPositioning:
 
     def interpret_put_call_ratio(self, symbol: str = "SPY", max_dte: int = 7) -> dict:
         """Interpret put/call ratio with contrarian and confirming signals."""
-        from alpaca.data.requests import OptionChainRequest
-        from datetime import date
-        today = date.today()
-        req = OptionChainRequest(
-            underlying_symbol=symbol,
-            expiration_date_gte=today,
-            expiration_date_lte=today + timedelta(days=max_dte),
-        )
-        chain = self.opt_client.get_option_chain(req)
+        chain = self._fetch_option_chain(symbol, max_dte)
 
         call_vol = 0
         put_vol = 0
         call_oi = 0
         put_oi = 0
 
-        for sym, snap in chain.items():
-            if not snap.latest_trade and not snap.latest_quote:
-                continue
-            vol = int((snap.latest_trade and snap.latest_trade.size) or 0)
-            oi = 0  # OI not available in snapshot
-            if "C" in sym:
+        for opt in chain:
+            vol = opt["volume"]
+            oi = opt["open_interest"]
+            if opt["is_call"]:
                 call_vol += vol
                 call_oi += oi
-            elif "P" in sym:
+            else:
                 put_vol += vol
                 put_oi += oi
 
@@ -332,35 +325,24 @@ class GammaPositioning:
 
     def detect_unusual_activity(self, symbol: str = "SPY", max_dte: int = 7) -> dict:
         """Detect unusual options activity (UOA)."""
-        from alpaca.data.requests import OptionChainRequest
-        from datetime import date
-        today = date.today()
-        req = OptionChainRequest(
-            underlying_symbol=symbol,
-            expiration_date_gte=today,
-            expiration_date_lte=today + timedelta(days=max_dte),
-        )
-        chain = self.opt_client.get_option_chain(req)
+        chain = self._fetch_option_chain(symbol, max_dte)
 
         unusual = []
-        for sym, snap in chain.items():
-            if not snap.latest_trade or not snap.latest_quote:
-                continue
-            vol = int((snap.latest_trade and snap.latest_trade.size) or 0)
-            oi = 0  # OI not available in snapshot
+        for opt in chain:
+            vol = opt["volume"]
+            oi = opt["open_interest"]
             if oi == 0:
                 continue
 
             vol_oi_ratio = vol / oi
             if vol_oi_ratio > 2.0:  # Volume > 2x OI = unusual
-                is_call = "C" in sym
                 unusual.append({
-                    "symbol": sym,
-                    "type": "call" if is_call else "put",
+                    "symbol": opt["symbol"],
+                    "type": "call" if opt["is_call"] else "put",
                     "volume": vol,
                     "oi": oi,
                     "vol_oi_ratio": round(vol_oi_ratio, 2),
-                    "signal": "BULLISH" if is_call else "BEARISH",
+                    "signal": "BULLISH" if opt["is_call"] else "BEARISH",
                 })
 
         unusual.sort(key=lambda x: x["vol_oi_ratio"], reverse=True)

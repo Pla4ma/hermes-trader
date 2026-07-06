@@ -378,8 +378,8 @@ class TestDailyWorkflow:
 class TestEdgeCases:
     def test_config_redacted_repr_has_no_secrets(self):
         r = config.redacted_repr()
-        assert "alpaca_api_key" in r
-        assert r["alpaca_api_key_set"] is False or isinstance(r["alpaca_api_key_set"], bool)
+        assert "robinhood_account_number" in r
+        assert "robinhood_token_exists" in r
 
     def test_candidate_score_total_never_exceeds_100(self):
         engine = ScoringEngine()

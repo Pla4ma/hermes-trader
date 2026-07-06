@@ -24,42 +24,34 @@ Key rules:
 - Force exit by 3:45 PM ET
 - Max 1-2% risk per trade
 - Daily loss limit: 5% of account
+
+Execution: Robinhood MCP via JSON-RPC (place_option_order)
 """
 
 import json
-import os
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
+
+from .integrations.robinhood_broker import (
+    ROBINHOOD_ACCOUNT,
+    BrokerError,
+    robinhood_mcp_call,
+)
 
 logger = logging.getLogger("hermes_trader.options_v3")
 
 
 class PremiumSellerEngine:
-    """Sell premium. Collect theta. Win more often."""
+    """Sell premium. Collect theta. Win more often.
+
+    All execution routes through Robinhood MCP (JSON-RPC).
+    Option chain analysis uses yfinance (no Robinhood chain endpoint).
+    """
 
     def __init__(self):
-        self.api_key = os.getenv("ALPACA_API_KEY", "")
-        self.secret_key = os.getenv("ALPACA_SECRET_KEY", "")
-        self.base_url = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
-        self._opt_client = None
-        self._trading_client = None
         self._spy_price = None
         self._vix_data = None
-
-    @property
-    def opt_client(self):
-        if self._opt_client is None:
-            from alpaca.data.historical import OptionHistoricalDataClient
-            self._opt_client = OptionHistoricalDataClient(self.api_key, self.secret_key)
-        return self._opt_client
-
-    @property
-    def trading_client(self):
-        if self._trading_client is None:
-            from alpaca.trading.client import TradingClient
-            self._trading_client = TradingClient(self.api_key, self.secret_key, paper=False)
-        return self._trading_client
 
     @property
     def spy_price(self):
@@ -156,57 +148,55 @@ class PremiumSellerEngine:
                            target_delta: float = 0.16, max_dte: int = 1) -> dict:
         """Find the best credit spread to sell.
 
+        Uses yfinance for option chain data (Robinhood MCP lacks chain endpoint).
+
         Args:
             direction: "put" for bull put spread, "call" for bear call spread
             width: Spread width in dollars — RESEARCH: $1-wide for $50 accounts
             target_delta: Target delta — RESEARCH: 16 delta = tastylive sweet spot (84% WR)
             max_dte: Days to expiration (1 = 0DTE)
         """
-        from alpaca.data.requests import OptionChainRequest
+        import yfinance as yf
 
         today = datetime.utcnow().date()
         max_expiry = today + timedelta(days=max_dte)
 
-        req = OptionChainRequest(
-            underlying_symbol="SPY",
-            expiration_date_gte=today,
-            expiration_date_lte=max_expiry,
-        )
-        chain = self.opt_client.get_option_chain(req)
+        # Get option chain via yfinance
+        ticker = yf.Ticker("SPY")
+        expirations = [
+            exp for exp in ticker.options
+            if today <= datetime.strptime(exp, "%Y-%m-%d").date() <= max_expiry
+        ]
+
+        if not expirations:
+            return {"error": "No expirations found"}
 
         spy = self.spy_price
         options = []
 
-        for sym, snap in chain.items():
-            if not snap.latest_quote or not snap.greeks:
-                continue
-            q = snap.latest_quote
-            bid = float(q.bid_price or 0)
-            ask = float(q.ask_price or 0)
-            if bid <= 0 or ask <= 0:
-                continue
-
-            delta = abs(float(snap.greeks.delta or 0))
-            is_call = "C" in sym
-            is_put = "P" in sym
-
-            if direction == "put" and not is_put:
-                continue
-            if direction == "call" and not is_call:
-                continue
-
+        for exp in expirations:
             try:
-                if is_call:
-                    strike = float(sym.split("C")[1]) / 1000
-                else:
-                    strike = float(sym.split("P")[1]) / 1000
-            except (ValueError, IndexError):
-                continue
+                chain = ticker.option_chain(exp)
+                df = chain.calls if direction == "call" else chain.puts
 
-            options.append({
-                "symbol": sym, "strike": strike, "bid": bid, "ask": ask,
-                "mid": (bid + ask) / 2, "delta": delta,
-            })
+                for _, row in df.iterrows():
+                    bid = float(row.get("bid", 0) or 0)
+                    ask = float(row.get("ask", 0) or 0)
+                    delta = abs(float(row.get("delta", 0) or 0))
+                    strike = float(row["strike"])
+                    sym = row.get("contractSymbol", f"SPY{exp.replace('-', '')}{'C' if direction == 'call' else 'P'}{int(strike * 1000):08d}")
+
+                    if bid <= 0 or ask <= 0:
+                        continue
+
+                    options.append({
+                        "symbol": sym, "strike": strike, "bid": bid, "ask": ask,
+                        "mid": (bid + ask) / 2, "delta": delta,
+                        "expiration": exp,
+                    })
+            except Exception as e:
+                logger.warning(f"Failed to fetch chain for {exp}: {e}")
+                continue
 
         options.sort(key=lambda x: x["strike"])
 
@@ -347,16 +337,14 @@ class PremiumSellerEngine:
         }
 
     def execute_trade(self, trade: dict) -> dict:
-        """Execute a credit spread or iron condor."""
-        from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
-        from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
-
+        """Execute a credit spread or iron condor via Robinhood MCP."""
         try:
             strategy = trade.get("strategy", "")
 
             if strategy == "iron_condor":
-                # Execute both spreads
+                # Execute put spread
                 put_result = self._execute_spread(trade["put_spread"], "put")
+                # Execute call spread
                 call_result = self._execute_spread(trade["call_spread"], "call")
                 return {
                     "action": "IRON_CONDOR",
@@ -374,55 +362,49 @@ class PremiumSellerEngine:
             return {"error": str(e)}
 
     def _execute_spread(self, spread: dict, direction: str) -> dict:
-        """Execute a single credit spread."""
-        from alpaca.trading.requests import LimitOrderRequest
-        from alpaca.trading.enums import OrderSide, TimeInForce
+        """Execute a single credit spread via Robinhood MCP place_option_order.
 
+        Submits a multi-leg order with both legs atomically.
+        """
         short_sym = spread["short_leg"]["symbol"]
         long_sym = spread["long_leg"]["symbol"]
-        credit = spread["credit"]
 
-        # Build the order
-        # We SELL the short leg and BUY the long leg
+        # Determine order type: limit if we have limit prices, market otherwise
+        short_price = round(spread["short_leg"]["bid"], 2)
+        long_price = round(spread["long_leg"]["ask"], 2)
+
         try:
-            # For now, execute as two separate orders
-            # TODO: Use Alpaca's multi-leg order when available
-
-            # Sell short leg
-            short_order = self.trading_client.submit_order(
-                LimitOrderRequest(
-                    symbol=short_sym,
-                    qty=1,
-                    side=OrderSide.SELL,
-                    limit_price=round(spread["short_leg"]["bid"], 2),
-                    time_in_force=TimeInForce.DAY,
-                )
-            )
-
-            # Buy long leg
-            long_order = self.trading_client.submit_order(
-                LimitOrderRequest(
-                    symbol=long_sym,
-                    qty=1,
-                    side=OrderSide.BUY,
-                    limit_price=round(spread["long_leg"]["ask"], 2),
-                    time_in_force=TimeInForce.DAY,
-                )
-            )
-
-            result = {
-                "action": f"{'BULL' if direction == 'put' else 'BEAR'}_{'PUT' if direction == 'put' else 'CALL'}_SPREAD",
-                "short_order_id": str(short_order.id),
-                "long_order_id": str(long_order.id),
-                "credit": spread["credit_dollars"],
-                "max_loss": spread["max_loss_dollars"],
-                "short_strike": spread["short_leg"]["strike"],
-                "long_strike": spread["long_leg"]["strike"],
-                "breakeven": spread["breakeven"],
-                "estimated_wr": spread["estimated_win_rate"],
+            # Build multi-leg order via Robinhood MCP
+            args = {
+                "account_number": ROBINHOOD_ACCOUNT,
+                "legs": [
+                    {
+                        "instrument_symbol": short_sym,
+                        "side": "sell",
+                        "quantity": "1",
+                    },
+                    {
+                        "instrument_symbol": long_sym,
+                        "side": "buy",
+                        "quantity": "1",
+                    },
+                ],
+                "type": "limit",
+                "time_in_force": "day",
             }
 
-            # Log
+            # Set limit price at the net credit (short bid - long ask)
+            net_credit = short_price - long_price
+            if net_credit > 0:
+                args["price"] = str(round(net_credit, 2))
+
+            # Submit the multi-leg option order
+            result = robinhood_mcp_call("place_option_order", args)
+
+            order_id = result.get("id", result.get("order_id", ""))
+            rh_status = result.get("status", "")
+
+            # Log the execution
             entry = {
                 "timestamp": datetime.utcnow().isoformat(),
                 "action": "SELL_CREDIT_SPREAD",
@@ -436,16 +418,31 @@ class PremiumSellerEngine:
                 "max_loss": spread["max_loss_dollars"],
                 "breakeven": spread["breakeven"],
                 "estimated_wr": spread["estimated_win_rate"],
-                "short_order_id": str(short_order.id),
-                "long_order_id": str(long_order.id),
+                "rh_order_id": order_id,
+                "rh_status": rh_status,
                 "engine": "options_v3_premium_seller",
+                "broker": "robinhood_mcp",
             }
-            with open("/opt/hermes-trader/data/journals/paper_orders.jsonl", "a") as f:
+            with open("/opt/hermes-trader/data/journals/robinhood_orders.jsonl", "a") as f:
                 f.write(json.dumps(entry) + "\n")
 
-            return result
+            return {
+                "action": f"{'BULL' if direction == 'put' else 'BEAR'}_{'PUT' if direction == 'put' else 'CALL'}_SPREAD",
+                "rh_order_id": order_id,
+                "rh_status": rh_status,
+                "credit": spread["credit_dollars"],
+                "max_loss": spread["max_loss_dollars"],
+                "short_strike": spread["short_leg"]["strike"],
+                "long_strike": spread["long_leg"]["strike"],
+                "breakeven": spread["breakeven"],
+                "estimated_wr": spread["estimated_win_rate"],
+            }
 
+        except BrokerError as e:
+            logger.error(f"Robinhood MCP spread execution failed: {e}")
+            return {"error": str(e)}
         except Exception as e:
+            logger.error(f"Unexpected spread execution error: {e}")
             return {"error": str(e)}
 
     def auto_trade(self) -> dict:
@@ -460,9 +457,18 @@ class PremiumSellerEngine:
         return result
 
     def _get_cash(self) -> float:
+        """Get available cash via Robinhood MCP."""
         try:
-            return float(self.trading_client.get_account().cash)
-        except Exception:
+            account_data = robinhood_mcp_call("get_accounts", {})
+            if isinstance(account_data, dict):
+                # Try multiple field names for cash balance
+                for field in ("cash", "cash_balance", "available_cash", "buying_power"):
+                    val = account_data.get(field)
+                    if val is not None:
+                        return float(val)
+            return 0.0
+        except (BrokerError, ValueError, TypeError) as e:
+            logger.warning(f"Failed to get cash from Robinhood: {e}")
             return 0.0
 
     def get_day_of_week(self) -> dict:
@@ -481,49 +487,106 @@ class PremiumSellerEngine:
         return max(0, ((win_rate * avg_win - (1 - win_rate) * avg_loss) / avg_win) * fraction)
 
     def get_iv_rank(self, symbol="SPY"):
+        """Get IV rank using yfinance (Robinhood MCP lacks chain endpoint)."""
         try:
-            from alpaca.data.requests import OptionChainRequest
+            import yfinance as yf
             today = datetime.utcnow().date()
-            req = OptionChainRequest(underlying_symbol=symbol, expiration_date_gte=today, expiration_date_lte=today + timedelta(days=7))
-            chain = self.opt_client.get_option_chain(req)
+            ticker = yf.Ticker(symbol)
+            expirations = [
+                exp for exp in ticker.options
+                if today <= datetime.strptime(exp, "%Y-%m-%d").date() <= today + timedelta(days=7)
+            ]
+
             current_iv = 0.15
-            for sym_name, snap in chain.items():
-                if "C" not in sym_name or not snap.implied_volatility or not snap.latest_quote: continue
+            for exp in expirations:
                 try:
-                    strike = float(sym_name.split("C")[1]) / 1000
-                    if abs(strike - self.spy_price) < 2:
-                        current_iv = float(snap.implied_volatility); break
-                except: continue
+                    chain = ticker.option_chain(exp)
+                    for _, row in chain.calls.iterrows():
+                        if "C" not in str(row.get("contractSymbol", "")):
+                            continue
+                        strike = float(row["strike"])
+                        if abs(strike - self.spy_price) < 2:
+                            current_iv = float(row.get("impliedVolatility", 0.15) or 0.15)
+                            break
+                except Exception:
+                    continue
+
             return max(0, min(100, (current_iv - 0.10) / 0.30 * 100))
-        except: return 50
+        except Exception:
+            return 50
 
     def check_profit_target(self):
+        """Check positions for 50% profit target via Robinhood MCP."""
         try:
-            positions = self.trading_client.get_all_positions()
+            positions_data = robinhood_mcp_call("get_equity_positions", {
+                "account_number": ROBINHOOD_ACCOUNT,
+            })
             actions = []
+            if isinstance(positions_data, dict):
+                positions = positions_data.get("results", positions_data.get("positions", []))
+            elif isinstance(positions_data, list):
+                positions = positions_data
+            else:
+                return {"actions": []}
+
             for pos in positions:
-                unrealized = float(pos.unrealized_pl)
-                cost_basis = float(pos.avg_entry_price) * abs(float(pos.qty)) * 100
+                if not isinstance(pos, dict):
+                    continue
+                # Option positions have different fields
+                symbol = pos.get("symbol", pos.get("instrument_symbol", ""))
+                unrealized = float(pos.get("unrealized_pl", pos.get("unrealized_pnl", 0)) or 0)
+                cost_basis = float(pos.get("cost_basis", pos.get("avg_entry_price", 0)) or 0)
+                qty = abs(float(pos.get("quantity", pos.get("qty", 1)) or 1))
+
                 if cost_basis > 0 and unrealized > 0:
-                    profit_pct = unrealized / cost_basis * 100
+                    profit_pct = unrealized / (cost_basis * qty) * 100
                     if profit_pct >= 50:
-                        actions.append({"symbol": pos.symbol, "action": "CLOSE_50_PROFIT", "profit_pct": round(profit_pct, 1)})
+                        actions.append({
+                            "symbol": symbol,
+                            "action": "CLOSE_50_PROFIT",
+                            "profit_pct": round(profit_pct, 1),
+                        })
             return {"actions": actions}
-        except Exception as e: return {"error": str(e)}
+        except (BrokerError, ValueError, TypeError) as e:
+            return {"error": str(e)}
 
     def check_dte_exit(self):
+        """Check positions for DTE-based exit via Robinhood MCP."""
         try:
-            positions = self.trading_client.get_all_positions()
+            positions_data = robinhood_mcp_call("get_equity_positions", {
+                "account_number": ROBINHOOD_ACCOUNT,
+            })
             actions = []
             today = datetime.utcnow().date()
+
+            if isinstance(positions_data, dict):
+                positions = positions_data.get("results", positions_data.get("positions", []))
+            elif isinstance(positions_data, list):
+                positions = positions_data
+            else:
+                return {"actions": []}
+
             for pos in positions:
-                if not any(c.isdigit() for c in pos.symbol): continue
+                if not isinstance(pos, dict):
+                    continue
+                symbol = pos.get("symbol", pos.get("instrument_symbol", ""))
+                if not any(c.isdigit() for c in symbol):
+                    continue
                 try:
-                    dte = (datetime.strptime(f"20{pos.symbol[3:9]}", "%Y%m%d").date() - today).days
-                    if dte <= 21: actions.append({"symbol": pos.symbol, "action": "CLOSE_DTE_EXIT", "dte": dte})
-                except: continue
+                    # Parse expiry from option symbol (format: SPY260706P00540000)
+                    exp_str = symbol[3:9]
+                    dte = (datetime.strptime(f"20{exp_str}", "%Y%m%d").date() - today).days
+                    if dte <= 21:
+                        actions.append({
+                            "symbol": symbol,
+                            "action": "CLOSE_DTE_EXIT",
+                            "dte": dte,
+                        })
+                except (ValueError, IndexError):
+                    continue
             return {"actions": actions}
-        except Exception as e: return {"error": str(e)}
+        except (BrokerError, ValueError, TypeError) as e:
+            return {"error": str(e)}
 
     def select_strategy(self) -> dict:
         filters = self.check_filters()
@@ -549,7 +612,7 @@ if __name__ == "__main__":
 
     engine = PremiumSellerEngine()
 
-    print("=== PREMIUM SELLER ENGINE v3 ===")
+    print("=== PREMIUM SELLER ENGINE v3 (Robinhood MCP) ===")
     print(f"SPY: ${engine.spy_price:.2f}")
     print(f"VIX: {engine.vix_data['vix']:.1f}")
     print(f"VIX3M: {engine.vix_data['vix3m']:.1f}")

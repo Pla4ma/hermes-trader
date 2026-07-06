@@ -7,13 +7,13 @@ from datetime import datetime
 
 from .workflow import DailyWorkflow
 from .config import config
-from .integrations.alpaca_broker import PaperBrokerAdapter
+from .integrations.robinhood_broker import RobinhoodBrokerAdapter
 from .monitoring.telegram_reporter import format_report
 
 
 def cmd_status(_args):
     """Show current system status."""
-    broker = PaperBrokerAdapter()
+    broker = RobinhoodBrokerAdapter()
     account = broker.get_account()
 
     report = {

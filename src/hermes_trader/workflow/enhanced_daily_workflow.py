@@ -24,7 +24,7 @@ from ..monitoring.advanced_position_monitor import (
     ProfitTakingConfig, TimeDecayConfig
 )
 from ..research.backtest_validator import BacktestValidator
-from ..integrations.alpaca_broker import PaperBrokerAdapter
+from ..integrations.robinhood_broker import RobinhoodBrokerAdapter
 
 logger = logging.getLogger("hermes_trader.workflow.enhanced")
 
@@ -39,7 +39,7 @@ class EnhancedDailyWorkflow:
         
         self.policy_engine = PolicyEngine()
         self.scoring_engine = ScoringEngine()
-        self.broker = PaperBrokerAdapter()
+        self.broker = RobinhoodBrokerAdapter()
         
         self._momentum_scanner = MomentumScanner(lookback_days=config.spy_breakout_lookback_days)
         self._backtest_validator = BacktestValidator()

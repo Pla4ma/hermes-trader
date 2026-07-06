@@ -4,27 +4,28 @@ import json
 import os
 from datetime import datetime
 
+from .integrations.robinhood_broker import (
+    _safe_float,
+    robinhood_mcp_call,
+)
+
 
 def health_check() -> dict:
     """Run comprehensive system health check."""
     checks = {}
 
-    # 1. Alpaca API connection
+    # 1. Robinhood MCP connection
     try:
-        import alpaca_trade_api as tradeapi
-        api_key = os.getenv("ALPACA_API_KEY", "")
-        secret_key = os.getenv("ALPACA_SECRET_KEY", "")
-        base_url = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
-        api = tradeapi.REST(api_key, secret_key, base_url)
-        acct = api.get_account()
-        checks["alpaca"] = {
+        account_data = robinhood_mcp_call("get_accounts", {})
+        equity = _safe_float(account_data, "equity", "portfolio_value", "account_value")
+        cash = _safe_float(account_data, "cash", "cash_balance", "available_cash")
+        checks["robinhood"] = {
             "status": "OK",
-            "equity": float(acct.portfolio_value),
-            "cash": float(acct.cash),
-            "account_status": acct.status,
+            "equity": equity,
+            "cash": cash,
         }
     except Exception as e:
-        checks["alpaca"] = {"status": "FAIL", "error": str(e)}
+        checks["robinhood"] = {"status": "FAIL", "error": str(e)}
 
     # 2. yfinance market data
     try:
@@ -45,7 +46,7 @@ def health_check() -> dict:
             content = f.read()
         checks["env"] = {
             "status": "OK",
-            "has_alpaca_key": "ALPACA_API_KEY=AKG" in content,
+            "has_robinhood_token": os.path.exists(os.path.expanduser("~/.hermes/mcp-tokens/robinhood.json")),
             "has_live_trading": "ENABLE_LIVE_TRADING=true" in content,
             "has_cyrillic": any(ord(c) > 127 for c in content),
         }
