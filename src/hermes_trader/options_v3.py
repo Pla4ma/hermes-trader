@@ -459,13 +459,18 @@ class PremiumSellerEngine:
     def _get_cash(self) -> float:
         """Get available cash via Robinhood MCP."""
         try:
-            account_data = robinhood_mcp_call("get_accounts", {})
+            account_data = robinhood_mcp_call("get_portfolio", {"account_number": ROBINHOOD_ACCOUNT})
             if isinstance(account_data, dict):
+                pdata = account_data.get("data", account_data)
                 # Try multiple field names for cash balance
-                for field in ("cash", "cash_balance", "available_cash", "buying_power"):
-                    val = account_data.get(field)
+                for field in ("cash", "cash_balance", "available_cash"):
+                    val = pdata.get(field) if isinstance(pdata, dict) else None
                     if val is not None:
                         return float(val)
+                # buying_power is nested
+                bp = pdata.get("buying_power", {}) if isinstance(pdata, dict) else {}
+                if isinstance(bp, dict):
+                    return float(bp.get("buying_power", 0))
             return 0.0
         except (BrokerError, ValueError, TypeError) as e:
             logger.warning(f"Failed to get cash from Robinhood: {e}")

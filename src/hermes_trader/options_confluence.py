@@ -879,8 +879,8 @@ class OptionsConfluenceScanner:
 
                     mid = (bid + ask) / 2
                     strike = float(row["strike"])
-                    volume = int(row.get("volume", 0) or 0)
-                    oi = int(row.get("openInterest", 0) or 0)
+                    volume = int(float(row.get("volume", 0) or 0) if row.get("volume", 0) is not None and str(row.get("volume", 0)) != "nan" else 0)
+                    oi = int(float(row.get("openInterest", 0) or 0) if row.get("openInterest", 0) is not None and str(row.get("openInterest", 0)) != "nan" else 0)
 
                     # Compute Greeks from IV using Black-Scholes
                     opt_type = "call" if is_call else "put"

@@ -84,7 +84,7 @@ def robinhood_mcp_call(tool_name: str, arguments: Optional[dict] = None) -> Any:
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
-        "Accept": "text/event-stream",
+        "Accept": "application/json, text/event-stream",
     }
 
     try:
@@ -201,16 +201,25 @@ class RobinhoodBrokerAdapter:
 
     def _fetch_account_snapshot(self) -> AccountSnapshot:
         """Fetch real account + positions from Robinhood MCP."""
-        # Get account info
-        account_data = robinhood_mcp_call("get_accounts", {})
+        # Get portfolio values (cash, equity, buying_power)
+        portfolio_data = robinhood_mcp_call("get_portfolio", {
+            "account_number": ROBINHOOD_ACCOUNT,
+        })
+        # Get positions
         positions_data = robinhood_mcp_call("get_equity_positions", {
             "account_number": ROBINHOOD_ACCOUNT,
         })
 
-        # Parse account fields (flexible to response shape)
-        equity = _safe_float(account_data, "equity", "portfolio_value", "account_value", default=0.0)
-        cash = _safe_float(account_data, "cash", "cash_balance", "available_cash", default=0.0)
-        buying_power = _safe_float(account_data, "buying_power", "instant_buying_power", default=0.0)
+        # Parse portfolio fields — get_portfolio returns {data: {cash, equity_value, buying_power: {buying_power}}}
+        pdata = portfolio_data.get("data", portfolio_data) if isinstance(portfolio_data, dict) else {}
+        equity = _safe_float(pdata, "equity_value", "equity", "portfolio_value", "total_value", default=0.0)
+        cash = _safe_float(pdata, "cash", "cash_balance", "available_cash", default=0.0)
+        # buying_power is nested: {"buying_power": {"buying_power": "50.0000"}}
+        bp_raw = pdata.get("buying_power", {})
+        if isinstance(bp_raw, dict):
+            buying_power = _safe_float(bp_raw, "buying_power", "unleveraged_buying_power", default=0.0)
+        else:
+            buying_power = _safe_float(pdata, "buying_power", "instant_buying_power", default=0.0)
 
         # Parse positions
         positions = _parse_positions(positions_data)
@@ -467,6 +476,168 @@ class RobinhoodBrokerAdapter:
                 entry["status"] = "rh_error"
                 entry["error"] = str(e)
                 logger.error(f"close_position({symbol}) failed: {e}")
+        else:
+            entry["mode"] = "PAPER"
+
+        self._append_journal(entry)
+        return entry
+
+    def list_positions(self) -> list[dict]:
+        """Return all open positions as dicts (for auto_trader compatibility)."""
+        try:
+            data = robinhood_mcp_call("get_equity_positions", {
+                "account_number": ROBINHOOD_ACCOUNT,
+            })
+            positions = _parse_positions(data)
+            return [
+                {
+                    "symbol": p.symbol,
+                    "quantity": p.qty,
+                    "market_value": p.market_value,
+                    "cost_basis": p.cost_basis,
+                    "unrealized_pl": p.unrealized_pl,
+                    "unrealized_plpc": p.unrealized_plpc,
+                    "avg_entry_price": p.cost_basis / p.qty if p.qty > 0 else 0,
+                    "current_price": p.market_value / p.qty if p.qty > 0 else 0,
+                }
+                for p in positions
+            ]
+        except BrokerError as e:
+            logger.error(f"list_positions failed: {e}")
+            return []
+
+    def list_open_orders(self) -> list[dict]:
+        """Return current open orders as dicts (for auto_trader compatibility)."""
+        try:
+            data = robinhood_mcp_call("get_equity_orders", {
+                "account_number": ROBINHOOD_ACCOUNT,
+            })
+            orders = _parse_orders_list(data)
+            return [o for o in orders if o.get("status") not in ("filled", "canceled", "expired", "rejected")]
+        except BrokerError as e:
+            logger.warning(f"list_open_orders failed: {e}")
+            return []
+
+    def place_option_order(
+        self,
+        option_id: str,
+        side: str = "buy",
+        quantity: int = 1,
+        limit_price: str = None,
+        time_in_force: str = "day",
+    ) -> dict:
+        """Place a single-leg option order via Robinhood MCP place_option_order.
+
+        Args:
+            option_id: Option instrument UUID from get_option_instruments.
+            side: 'buy' or 'sell'.
+            quantity: Number of contracts.
+            limit_price: Limit price per contract (string). If None, uses market order.
+            time_in_force: 'day' or 'gtc'.
+        """
+        args = {
+            "account_number": ROBINHOOD_ACCOUNT,
+            "legs": [
+                {
+                    "option_id": option_id,
+                    "side": side,
+                    "position_effect": "open",
+                }
+            ],
+            "quantity": quantity,
+        }
+        if limit_price:
+            args["type"] = "limit"
+            args["price"] = limit_price
+        else:
+            args["type"] = "market"
+        if time_in_force:
+            args["time_in_force"] = time_in_force
+
+        entry = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "order_id": f"rh_opt_{int(datetime.utcnow().timestamp())}_{option_id[:8]}",
+            "status": "submitted",
+            "side": side,
+            "option_id": option_id,
+            "quantity": quantity,
+            "limit_price": limit_price,
+        }
+
+        if config.is_live_unlocked:
+            entry["mode"] = "LIVE"
+            try:
+                result = robinhood_mcp_call("place_option_order", args)
+                entry["status"] = "filled"
+                entry["rh_order_id"] = result.get("id", result.get("order_id", ""))
+                entry["rh_status"] = result.get("status", "")
+                entry["filled_avg_price"] = result.get("filled_avg_price",
+                    result.get("average_fill_price", ""))
+            except Exception as e:
+                entry["status"] = "rh_error"
+                entry["error"] = str(e)
+                logger.error(f"place_option_order failed: {e}")
+        else:
+            entry["mode"] = "PAPER"
+
+        self._append_journal(entry)
+        return entry
+
+    def place_equity_order(
+        self,
+        symbol: str,
+        side: str,
+        notional: float = None,
+        quantity: float = None,
+        order_type: str = "market",
+        limit_price: float = None,
+        stop_price: float = None,
+        time_in_force: str = "day",
+    ) -> dict:
+        """Place an equity order via Robinhood MCP.
+
+        Convenience wrapper for auto_trader / manage_exits.
+        """
+        entry = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "order_id": f"rh_eq_{int(datetime.utcnow().timestamp())}_{symbol}",
+            "status": "submitted",
+            "side": side,
+            "symbol": symbol,
+            "notional": notional,
+            "quantity": quantity,
+            "order_type": order_type,
+        }
+
+        if config.is_live_unlocked:
+            entry["mode"] = "LIVE"
+            try:
+                args = {
+                    "account_number": ROBINHOOD_ACCOUNT,
+                    "symbol": symbol.upper(),
+                    "side": side,
+                    "type": order_type,
+                    "time_in_force": time_in_force,
+                }
+                if notional and float(notional) > 0:
+                    args["amount"] = str(round(float(notional), 2))
+                    args["type"] = "market"
+                elif quantity and float(quantity) > 0:
+                    args["quantity"] = str(int(quantity))
+                if limit_price and float(limit_price) > 0:
+                    args["price"] = str(limit_price)
+                    args["type"] = "limit"
+                if stop_price and float(stop_price) > 0:
+                    args["stop_price"] = str(stop_price)
+
+                result = robinhood_mcp_call("place_equity_order", args)
+                entry["status"] = "filled"
+                entry["rh_order_id"] = result.get("id", result.get("order_id", ""))
+                entry["rh_status"] = result.get("status", "")
+            except Exception as e:
+                entry["status"] = "rh_error"
+                entry["error"] = str(e)
+                logger.error(f"place_equity_order failed: {e}")
         else:
             entry["mode"] = "PAPER"
 

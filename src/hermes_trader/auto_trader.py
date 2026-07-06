@@ -1,13 +1,20 @@
-"""Auto-trading engine — discovers candidates and executes trades.
+"""Auto-trading engine — discovers 0DTE candidates and executes option trades.
 
 This module is called by the cron jobs to autonomously scan, score,
-and execute trades on the live Robinhood account via MCP.
+and execute 0DTE option trades on the live Robinhood account via MCP.
+
+Flow:
+  1. Scan 0DTE options via zero_dte_scanner (Robinhood MCP chains)
+  2. Score candidates with multi-factor confluence scoring
+  3. Check Vibe-Trading + TradingAgents research gates (both must agree)
+  4. Place option order via Robinhood MCP place_option_order
+  5. Set exit rules (trailing stops, profit-taking)
 """
 import json
 import logging
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 
 logger = logging.getLogger("hermes_trader.auto_trader")
@@ -17,104 +24,79 @@ ACCOUNT_NUMBER = os.getenv("ROBINHOOD_ACCOUNT_NUMBER", "924058324")
 
 def _get_broker():
     """Get the Robinhood broker adapter instance."""
-    from .integrations.robinhood_broker import RobinhoodBroker
-    return RobinhoodBroker(account_number=ACCOUNT_NUMBER)
+    from .integrations.robinhood_broker import RobinhoodBrokerAdapter
+    return RobinhoodBrokerAdapter()
 
 
 def scan_and_score(symbols: list[str] = None) -> list[dict]:
-    """Scan watchlist with 6-factor confluence scoring."""
+    """Scan 0DTE options and score with multi-factor confluence.
+
+    Replaces the old equity-based scanning. Now scans 0DTE options
+    on SPY/QQQ/SPXW/NDXW for day-trade candidates.
+    """
+    from .zero_dte_scanner import scan_0dte, get_spot_price
     import yfinance as yf
     import numpy as np
 
     if symbols is None:
-        symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "META", "GOOGL", "AMD", "AMZN", "NFLX"]
+        symbols = ["SPY", "QQQ", "SPXW", "NDXW"]
 
-    results = []
-    for sym in symbols:
-        try:
-            data = yf.Ticker(sym).history(period="3mo")
-            if len(data) < 21:
-                continue
-            close = data["Close"]
-            high = data["High"]
-            low = data["Low"]
-            vol = data["Volume"]
-            price = close.iloc[-1]
+    # ── Phase 1: 0DTE Option Scanning via Robinhood MCP ──
+    candidates_0dte = scan_0dte(symbols=symbols, min_score=20, max_candidates=20)
 
-            ma20 = close.rolling(20).mean().iloc[-1]
-            ma50 = close.rolling(min(50, len(close))).mean().iloc[-1]
-            delta = close.diff()
-            gain = delta.clip(lower=0).rolling(14).mean()
-            loss = (-delta.clip(upper=0)).rolling(14).mean()
-            rsi = (100 - (100 / (1 + gain / loss))).iloc[-1]
-            ema12 = close.ewm(span=12).mean()
-            ema26 = close.ewm(span=26).mean()
-            macd_hist = (ema12 - ema26) - (ema12 - ema26).ewm(span=9).mean()
-            tr = np.maximum(high - low, np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
-            atr = tr.rolling(14).mean().iloc[-1]
-            ret5 = (close.iloc[-1] / close.iloc[-6] - 1) * 100
-            ret20 = (close.iloc[-1] / close.iloc[-21] - 1) * 100
-            vol_avg = vol.rolling(20).mean().iloc[-1]
-            vol_ratio = vol.iloc[-1] / vol_avg if vol_avg > 0 else 1
-            h20 = high.rolling(20).max().iloc[-1]
-            l20 = low.rolling(20).min().iloc[-1]
-            pos = (price - l20) / (h20 - l20) if h20 != l20 else 0.5
+    if candidates_0dte:
+        # Enrich 0DTE candidates with additional scoring
+        for c in candidates_0dte:
+            # Add confluence context from underlying
+            sym = symbols[0] if symbols else "SPY"
+            try:
+                spot = get_spot_price(sym)
+                if spot > 0:
+                    c["underlying_price"] = spot
+            except Exception:
+                pass
 
-            score = 0
-            if price > ma20:
-                score += 3
-            if ma20 > ma50:
-                score += 2
-            if ret5 > 5:
-                score += 5
-            elif ret5 > 2:
-                score += 3
-            elif ret5 > 0:
-                score += 1
-            if 40 < rsi < 60:
-                score += 3
-            elif rsi < 35:
-                score += 4
-            if macd_hist.iloc[-1] > 0:
-                score += 3
-            elif macd_hist.iloc[-1] > macd_hist.iloc[-2]:
-                score += 2
-            if vol_ratio > 1.5:
-                score += 4
-            elif vol_ratio > 1.0:
-                score += 2
-            if pos > 0.7:
-                score += 3
-            elif pos > 0.4:
-                score += 2
-            if ret20 > 5:
-                score += 2
+    # ── Phase 2: Underlying momentum check (optional enrichment) ──
+    if candidates_0dte:
+        # Add momentum-based signal to each candidate
+        for c in candidates_0dte:
+            try:
+                data = yf.Ticker(c.get("symbol", "SPY")).history(period="5d")
+                if len(data) >= 2:
+                    close = data["Close"]
+                    ret1d = (close.iloc[-1] / close.iloc[-2] - 1) * 100
+                    ret5d = (close.iloc[-1] / close.iloc[-6] - 1) * 100 if len(data) >= 6 else 0
+                    c["underlying_ret1d"] = round(ret1d, 2)
+                    c["underlying_ret5d"] = round(ret5d, 2)
+                    # Momentum bonus
+                    if ret1d > 0 and c.get("type") == "call":
+                        c["score"] += 5
+                    elif ret1d < 0 and c.get("type") == "put":
+                        c["score"] += 5
+            except Exception:
+                pass
 
-            results.append({
-                "symbol": sym, "price": round(price, 2), "score": min(score, 30),
-                "rsi": round(rsi, 1), "ret5": round(ret5, 2), "ret20": round(ret20, 2),
-                "macd_hist": round(float(macd_hist.iloc[-1]), 4),
-                "vol_ratio": round(vol_ratio, 2), "atr": round(float(atr), 2),
-                "stop": round(price - 2 * atr, 2), "target": round(price + 4 * atr, 2),
-            })
-        except Exception as e:
-            logger.warning(f"Scan failed for {sym}: {e}")
-
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results
+    # Sort by score
+    candidates_0dte.sort(key=lambda x: x.get("score", 0), reverse=True)
+    return candidates_0dte
 
 
-def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
-    """Scan, score, and execute the best trade if cash available.
+def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
+    """Scan 0DTE options, score, check research gates, and execute.
 
-    Integrates: GEX, PCR, IV Rank, Kelly sizing, earnings check, VIX term structure.
-    Executes via Robinhood MCP broker adapter.
+    Integrates: 0DTE scanner, GEX, PCR, IV Rank, Kelly sizing, earnings check.
+    Executes via Robinhood MCP place_option_order (not equity orders).
+
+    Args:
+        min_score: Minimum composite score (0-100) to consider a candidate
+        max_notional: Maximum dollar amount per trade (default $90 = 90% of $100)
     """
     broker = _get_broker()
 
     # ─── Get account state from Robinhood ───
-    cash = broker.get_account_cash()
-    held = broker.get_held_symbols()
+    account = broker.get_account()
+    cash = account.cash
+    held = [p.symbol for p in broker.get_positions()]
 
     # ─── Options Analytics (institutional-grade) ───
     analytics = {}
@@ -156,6 +138,7 @@ def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
         "regime": regime_name,
         "sizing_multiplier": sizing_mult,
         "action": "none",
+        "strategy": "0dte_options",
     }
 
     # Need at least $5 to trade
@@ -163,34 +146,40 @@ def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
         result["reason"] = f"Insufficient cash: ${cash:.2f}"
         return result
 
-    # Already max positions (3)
-    if len(held) >= 3:
-        result["reason"] = f"Max positions reached: {len(held)}"
-        return result
-
-    # Scan watchlist
+    # ─── Scan 0DTE options ───
     candidates = scan_and_score()
     result["candidates_found"] = len(candidates)
 
-    # Filter out held symbols and low scores
-    viable = [c for c in candidates if c["symbol"] not in held and c["score"] >= min_score]
+    # Filter by score
+    viable = [c for c in candidates if c.get("score", 0) >= min_score]
     result["viable_candidates"] = len(viable)
 
     if not viable:
-        result["reason"] = f"No candidates above {min_score}/30 threshold"
+        result["reason"] = f"No 0DTE candidates above {min_score}/100 threshold"
         return result
 
     best = viable[0]
-    notional = min(cash * 0.9, max_notional) * sizing_mult
+
+    # ─── Position Sizing ───
+    # 90% of account (max_notional=90 for $100 account)
+    # For options: notional = cash * 90% * regime_sizing
+    notional = min(cash * 0.90, max_notional) * sizing_mult
+
+    # If one research source disagrees, reduce by 50%
+    # (applied after research gates below)
 
     # Use optimal params if available
-    opt_params = _load_optimal_params(best["symbol"])
+    opt_params = _load_optimal_params(best.get("symbol", "SPY"))
 
     # ═══════════════════════════════════════════════════════════════
     # S-TIER RESEARCH: Vibe-Trading + TradingAgents BEFORE every trade
     # ═══════════════════════════════════════════════════════════════
-    vibe_signal = _run_vibe_research(best["symbol"])
-    agents_signal = _run_tradingagents_research(best["symbol"])
+    underlying_sym = best.get("symbol", "SPY").split("/")[0] if "/" in best.get("symbol", "") else best.get("symbol", "SPY")
+    # Strip W suffix for index symbols used in research
+    research_sym = underlying_sym.rstrip("W")
+
+    vibe_signal = _run_vibe_research(research_sym)
+    agents_signal = _run_tradingagents_research(research_sym)
 
     result["vibe_signal"] = vibe_signal
     result["agents_signal"] = agents_signal
@@ -201,7 +190,7 @@ def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
 
     if not vibe_agrees and not agents_agrees:
         result["action"] = "blocked"
-        result["reason"] = f"BOTH Vibe-Trading ({vibe_signal.get('signal')}) and TradingAgents ({agents_signal.get('signal')}) are BEARISH. Skipping {best['symbol']}."
+        result["reason"] = f"BOTH Vibe-Trading ({vibe_signal.get('signal')}) and TradingAgents ({agents_signal.get('signal')}) are BEARISH. Skipping {best.get('symbol', 'unknown')}."
         return result
 
     if not vibe_agrees or not agents_agrees:
@@ -209,52 +198,94 @@ def auto_trade(min_score: int = 12, max_notional: float = 20.0) -> dict:
         notional *= 0.5
         result["note"] = f"One research source disagrees — reducing size by 50% to ${notional:.2f}"
 
-    # Execute trade via Robinhood MCP
+    # ─── Calculate option quantity ───
+    # For options: notional / (mid_price * 100) = number of contracts
+    mid_price = best.get("mid", 0)
+    if mid_price <= 0:
+        result["action"] = "error"
+        result["error"] = f"Invalid option price: {mid_price}"
+        return result
+
+    # Each contract costs mid_price * $100
+    contract_cost = mid_price * 100
+    quantity = max(1, int(notional / contract_cost)) if contract_cost > 0 else 1
+
+    # Cap at what we can actually afford
+    max_affordable = int(cash / contract_cost) if contract_cost > 0 else 1
+    quantity = min(quantity, max_affordable)
+
+    if quantity < 1:
+        result["reason"] = f"Cannot afford even 1 contract (cost=${contract_cost:.2f}, cash=${cash:.2f})"
+        return result
+
+    result["quantity"] = quantity
+    result["contract_cost"] = contract_cost
+    result["total_cost"] = contract_cost * quantity
+
+    # ═══════════════════════════════════════════════════════════════
+    # EXECUTE OPTION ORDER via Robinhood MCP place_option_order
+    # ═══════════════════════════════════════════════════════════════
     try:
-        order = broker.place_equity_order(
-            symbol=best["symbol"],
+        order = broker.place_option_order(
+            option_id=best.get("option_id", ""),
             side="buy",
-            notional=round(notional, 2),
-            order_type="market",
+            quantity=quantity,
+            limit_price=str(round(mid_price, 4)),
             time_in_force="day",
         )
 
-        result["action"] = "BUY"
-        result["symbol"] = best["symbol"]
+        result["action"] = "BUY_OPTION"
+        result["symbol"] = best.get("symbol", "")
+        result["option_id"] = best.get("option_id", "")
+        result["option_type"] = best.get("type", "")
+        result["strike"] = best.get("strike", 0)
+        result["mid_price"] = mid_price
+        result["quantity"] = quantity
         result["notional"] = notional
-        result["score"] = best["score"]
-        result["price"] = best["price"]
-        result["order_id"] = order.get("order_id", "")
-        result["stop_loss"] = best["stop"]
-        result["take_profit"] = best["target"]
+        result["score"] = best.get("score", 0)
+        result["order_id"] = order.get("order_id", order.get("id", ""))
+        result["stop_loss"] = best.get("stop_loss", round(mid_price * 0.50, 4))
+        result["take_profit"] = best.get("take_profit", round(mid_price * 2.0, 4))
 
         # Log to journal
         entry = {
             "timestamp": datetime.utcnow().isoformat(),
-            "action": "BUY",
-            "symbol": best["symbol"],
+            "action": "BUY_OPTION",
+            "symbol": best.get("symbol", ""),
+            "option_id": best.get("option_id", ""),
+            "option_type": best.get("type", ""),
+            "strike": best.get("strike", 0),
+            "expiration": best.get("expiration", ""),
+            "mid_price": mid_price,
+            "quantity": quantity,
             "notional": notional,
-            "order_id": order.get("order_id", ""),
+            "total_cost": contract_cost * quantity,
+            "order_id": order.get("order_id", order.get("id", "")),
             "broker": "robinhood_mcp",
             "account_number": ACCOUNT_NUMBER,
-            "strategy": "auto_confluence",
-            "confluence_score": best["score"],
-            "rsi": best["rsi"],
-            "ret5": best["ret5"],
-            "stop_loss": best["stop"],
-            "take_profit": best["target"],
-            "reason": f"Auto-trade: {best['symbol']} score={best['score']}/30 RSI={best['rsi']} 5d={best['ret5']:+.1f}%",
+            "strategy": "0dte_options",
+            "confluence_score": best.get("score", 0),
+            "vibe_signal": vibe_signal.get("signal", "unknown"),
+            "agents_signal": agents_signal.get("signal", "unknown"),
+            "stop_loss": best.get("stop_loss", round(mid_price * 0.50, 4)),
+            "take_profit": best.get("take_profit", round(mid_price * 2.0, 4)),
+            "reason": f"Auto-trade 0DTE: {best.get('symbol', '')} {best.get('type', '')} strike={best.get('strike', 0)} score={best.get('score', 0)}/100",
         }
         journal_path = "/opt/hermes-trader/data/journals/paper_orders.jsonl"
+        os.makedirs(os.path.dirname(journal_path), exist_ok=True)
         with open(journal_path, "a") as f:
             f.write(json.dumps(entry) + "\n")
 
-        logger.info(f"AUTO-TRADE: {best['symbol']} ${notional:.2f} score={best['score']} via Robinhood MCP")
+        logger.info(
+            f"AUTO-TRADE 0DTE: {best.get('symbol', '')} {best.get('type', '')} "
+            f"strike={best.get('strike', 0)} x{quantity} "
+            f"${contract_cost * quantity:.2f} score={best.get('score', 0)}/100 via Robinhood MCP"
+        )
 
     except Exception as e:
         result["action"] = "error"
         result["error"] = str(e)
-        logger.error(f"Auto-trade failed: {e}")
+        logger.error(f"Auto-trade 0DTE failed: {e}")
 
     return result
 
@@ -315,14 +346,14 @@ def _load_optimal_params(symbol: str) -> dict:
 
 
 def manage_exits() -> dict:
-    """Check positions and manage exits with trailing stops + profit-taking.
+    """Check option positions and manage exits with trailing stops + profit-taking.
 
     All orders routed through Robinhood MCP broker adapter.
-    Strategy:
-    - Set SL at 1.5% below entry if no exit order exists
-    - If profit > 2.5%, tighten SL to trail by 0.8%
-    - If profit > 4%, sell 50% (partial profit-taking) via cron
-    - If profit > 8%, sell remaining via cron
+    For 0DTE options:
+    - If loss > 50%, close immediately (stop-loss)
+    - If profit > 50%, tighten trail to 20%
+    - If profit > 100%, sell 50%
+    - If profit > 200%, sell remaining
     """
     broker = _get_broker()
     positions = broker.list_positions()
@@ -346,11 +377,11 @@ def manage_exits() -> dict:
 
         pnl_pct = (current / entry - 1) * 100 if entry > 0 else 0
 
-        # Trailing stop logic
-        if pnl_pct >= 2.5:
-            # Tighten stop to trail by 0.8%
-            new_sl = round(current * 0.992, 2)
-            old_sl = round(entry * 0.985, 2)
+        # ── Trailing stop logic for options ──
+        if pnl_pct >= 50:
+            # Tighten stop to trail by 20% (for high-vol options)
+            new_sl = round(current * 0.80, 4)
+            old_sl = round(entry * 0.50, 4)
             if new_sl > old_sl:
                 # Cancel existing exit orders for this symbol
                 for o in open_orders:
@@ -380,9 +411,28 @@ def manage_exits() -> dict:
                 except Exception as e:
                     actions.append({"symbol": symbol, "action": "SL_ERROR", "error": str(e)})
 
+        elif pnl_pct <= -50:
+            # Hard stop-loss: close immediately at market
+            try:
+                order = broker.place_equity_order(
+                    symbol=symbol,
+                    side="sell",
+                    quantity=int(qty) if qty == int(qty) else None,
+                    notional=round(current * qty, 2) if qty != int(qty) else None,
+                    order_type="market",
+                    time_in_force="day",
+                )
+                actions.append({
+                    "symbol": symbol, "action": "STOP_LOSS_CLOSE",
+                    "pnl_pct": round(pnl_pct, 2),
+                    "order_id": order.get("order_id", ""),
+                })
+            except Exception as e:
+                actions.append({"symbol": symbol, "action": "SL_ERROR", "error": str(e)})
+
         elif symbol not in exit_symbols:
-            # No exit order — set initial SL at 1.5%
-            sl_price = round(entry * 0.985, 2)
+            # No exit order — set initial stop at 50% loss
+            sl_price = round(entry * 0.50, 4)
             try:
                 order = broker.place_equity_order(
                     symbol=symbol,
@@ -400,18 +450,18 @@ def manage_exits() -> dict:
             except Exception as e:
                 actions.append({"symbol": symbol, "action": "SL_ERROR", "error": str(e)})
 
-        # Profit-taking check (log for cron to execute)
-        if pnl_pct >= 4.0:
-            actions.append({
-                "symbol": symbol, "action": "TP_SIGNAL",
-                "pnl_pct": round(pnl_pct, 2),
-                "recommendation": "SELL_50%",
-            })
-        elif pnl_pct >= 8.0:
+        # ── Profit-taking signals (for cron to execute) ──
+        if pnl_pct >= 200:
             actions.append({
                 "symbol": symbol, "action": "TP_SIGNAL",
                 "pnl_pct": round(pnl_pct, 2),
                 "recommendation": "SELL_ALL",
+            })
+        elif pnl_pct >= 100:
+            actions.append({
+                "symbol": symbol, "action": "TP_SIGNAL",
+                "pnl_pct": round(pnl_pct, 2),
+                "recommendation": "SELL_50%",
             })
 
     return {"timestamp": datetime.utcnow().isoformat(), "actions": actions}

@@ -16,7 +16,9 @@ from .integrations.robinhood_broker import (
 def generate_risk_dashboard() -> dict:
     """Generate comprehensive risk metrics."""
     try:
-        account_data = robinhood_mcp_call("get_accounts", {})
+        portfolio_data = robinhood_mcp_call("get_portfolio", {
+            "account_number": ROBINHOOD_ACCOUNT,
+        })
         positions_data = robinhood_mcp_call("get_equity_positions", {
             "account_number": ROBINHOOD_ACCOUNT,
         })
@@ -24,9 +26,14 @@ def generate_risk_dashboard() -> dict:
             "account_number": ROBINHOOD_ACCOUNT,
         })
 
-        equity = _safe_float(account_data, "equity", "portfolio_value", "account_value")
-        cash = _safe_float(account_data, "cash", "cash_balance", "available_cash")
-        buying_power = _safe_float(account_data, "buying_power", "instant_buying_power")
+        pdata = portfolio_data.get("data", portfolio_data) if isinstance(portfolio_data, dict) else {}
+        equity = _safe_float(pdata, "equity_value", "equity", "total_value", "portfolio_value")
+        cash = _safe_float(pdata, "cash", "cash_balance", "available_cash")
+        bp_raw = pdata.get("buying_power", {})
+        if isinstance(bp_raw, dict):
+            buying_power = _safe_float(bp_raw, "buying_power", "unleveraged_buying_power")
+        else:
+            buying_power = _safe_float(pdata, "buying_power", "instant_buying_power")
 
         positions = _parse_positions(positions_data)
         orders = _parse_orders_list(orders_data)

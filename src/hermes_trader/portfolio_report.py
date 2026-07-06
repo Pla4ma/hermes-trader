@@ -16,7 +16,7 @@ from .integrations.robinhood_broker import (
 def generate_portfolio_report() -> str:
     """Generate a comprehensive portfolio report."""
     try:
-        account_data = robinhood_mcp_call("get_accounts", {})
+        account_data = robinhood_mcp_call("get_portfolio", {"account_number": ROBINHOOD_ACCOUNT})
         positions_data = robinhood_mcp_call("get_equity_positions", {
             "account_number": ROBINHOOD_ACCOUNT,
         })
@@ -24,8 +24,8 @@ def generate_portfolio_report() -> str:
             "account_number": ROBINHOOD_ACCOUNT,
         })
 
-        equity = _safe_float(account_data, "equity", "portfolio_value", "account_value")
-        cash = _safe_float(account_data, "cash", "cash_balance", "available_cash")
+        equity = _safe_float(account_data.get("data", account_data) if isinstance(account_data, dict) else {}, "equity_value", "equity", "total_value", "portfolio_value")
+        cash = _safe_float(account_data.get("data", account_data) if isinstance(account_data, dict) else {}, "cash", "cash_balance", "available_cash")
 
         positions = _parse_positions(positions_data)
         orders = _parse_orders_list(orders_data)
