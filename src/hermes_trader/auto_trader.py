@@ -18,8 +18,28 @@ from datetime import datetime, date
 from typing import Optional
 
 logger = logging.getLogger("hermes_trader.auto_trader")
-
 ACCOUNT_NUMBER = os.getenv("ROBINHOOD_ACCOUNT_NUMBER", "924058324")
+
+# ── Simple yfinance cache (60s TTL) ──
+_yf_cache = {}
+_yf_cache_ttl = 60  # seconds
+
+
+def _cached_yf_history(symbol: str, period: str = "5d"):
+    """Get cached yfinance history to avoid repeated API calls."""
+    import time
+    cache_key = f"{symbol}_{period}"
+    now = time.time()
+    
+    if cache_key in _yf_cache:
+        cached_time, cached_data = _yf_cache[cache_key]
+        if now - cached_time < _yf_cache_ttl:
+            return cached_data
+    
+    import yfinance as yf
+    data = yf.Ticker(symbol).history(period=period)
+    _yf_cache[cache_key] = (now, data)
+    return data
 
 
 def _notify_trade(action: str, details: dict):
@@ -82,7 +102,7 @@ def scan_and_score(symbols: list[str] = None) -> list[dict]:
         # Enrich 0DTE candidates with additional scoring
         for c in candidates_0dte:
             # Add confluence context from underlying
-            sym = symbols[0] if symbols else "SPY"
+            sym = c.get("symbol", "SPY").split("/")[0] if "/" in c.get("symbol", "") else c.get("symbol", "SPY")
             try:
                 spot = get_spot_price(sym)
                 if spot > 0:
@@ -350,7 +370,7 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
                 mag += 0.08
         
         # Distance from spot
-        spot = candidate.get("underlying_price", 0)
+        spot = candidate.get("underlying_price", 0) or candidate.get("spot", 0)
         strike = candidate.get("strike", 0)
         if spot > 0 and strike > 0:
             distance_pct = abs(strike - spot) / spot * 100
