@@ -456,6 +456,12 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
     def calculate_expected_value(probability, magnitude, cost_pct):
         """Calculate expected value: EV = (P × Mag) - ((1-P) × Cost)
         
+        For options, magnitude is the expected GAIN if right (e.g. 1.0 = 100% gain).
+        cost_pct is the expected LOSS if wrong (e.g. 0.50 = lose 50% via stop).
+        
+        With P=0.55, Mag=1.0 (target +100%), Cost=0.50 (stop at -50%):
+        EV = 0.55*1.0 - 0.45*0.50 = 0.55 - 0.225 = +0.325 (positive)
+        
         If EV > 0, trade has positive expected value.
         """
         ev = (probability * magnitude) - ((1 - probability) * cost_pct)
@@ -502,9 +508,17 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
     for c in viable:
         c["probability"] = calculate_probability(c, market_analytics)
         c["magnitude"] = calculate_magnitude(c, market_analytics)
-        # Calculate expected value
-        cost_pct = 0.50  # Assume 50% max loss (stop loss at -50%)
+        # Calculate expected value with proper options math:
+        # - gain = expected profit if trade wins (target ~100% for 0DTE)
+        # - loss = expected loss if trade loses (stop ~50%)
+        # With prob=0.55, gain=1.0, loss=0.50: EV = 0.55*1.0 - 0.45*0.50 = +0.325
+        gain_pct = max(c["magnitude"], 1.0)  # minimum 100% target
+        loss_pct = 0.50  # standard stop loss
         c["expected_value"] = calculate_expected_value(c["probability"], c["magnitude"], cost_pct)
+        # Override with proper options math (gain/loss are asymmetric)
+        c["expected_value"] = calculate_expected_value(
+            c["probability"], gain_pct, loss_pct
+        )
     
     # Filter by probability AND expected value
     quality_viable = [c for c in viable if c.get("probability", 0) >= MIN_PROBABILITY and c.get("expected_value", 0) >= MIN_EV]
