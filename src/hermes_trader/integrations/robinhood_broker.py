@@ -56,12 +56,13 @@ def _load_robinhood_token() -> str:
     return token
 
 
-def robinhood_mcp_call(tool_name: str, arguments: Optional[dict] = None) -> Any:
+def robinhood_mcp_call(tool_name: str, arguments: Optional[dict] = None, retries: int = 3) -> Any:
     """Make a JSON-RPC 2.0 call to the Robinhood MCP trading API.
 
     Args:
         tool_name: MCP tool name (e.g. "get_accounts", "place_equity_order").
         arguments: Tool arguments dict. Defaults to empty dict.
+        retries: Max retry attempts on rate limit (default 3).
 
     Returns:
         Parsed JSON result from the SSE response.
@@ -69,50 +70,78 @@ def robinhood_mcp_call(tool_name: str, arguments: Optional[dict] = None) -> Any:
     Raises:
         BrokerError: On HTTP errors, auth failures, or MCP error responses.
     """
-    token = _load_robinhood_token()
+    import time as _time
 
-    payload = {
-        "jsonrpc": "2.0",
-        "id": str(uuid.uuid4()),
-        "method": "tools/call",
-        "params": {
-            "name": tool_name,
-            "arguments": arguments or {},
-        },
-    }
+    for attempt in range(retries):
+        token = _load_robinhood_token()
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-    }
+        payload = {
+            "jsonrpc": "2.0",
+            "id": str(uuid.uuid4()),
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments or {},
+            },
+        }
 
-    try:
-        resp = requests.post(
-            ROBINHOOD_MCP_URL,
-            json=payload,
-            headers=headers,
-            timeout=30,
-        )
-    except requests.RequestException as e:
-        raise BrokerError(f"Robinhood MCP HTTP request failed: {e}") from e
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
 
-    if resp.status_code == 401:
-        raise BrokerError(
-            "Robinhood MCP auth failed (401). Token may be expired — "
-            "re-run the OAuth flow."
-        )
-    if resp.status_code == 403:
-        raise BrokerError(
-            "Robinhood MCP forbidden (403). Check account permissions."
-        )
-    if resp.status_code >= 400:
-        raise BrokerError(
-            f"Robinhood MCP HTTP {resp.status_code}: {resp.text[:500]}"
-        )
+        try:
+            resp = requests.post(
+                ROBINHOOD_MCP_URL,
+                json=payload,
+                headers=headers,
+                timeout=30,
+            )
+        except requests.RequestException as e:
+            raise BrokerError(f"Robinhood MCP HTTP request failed: {e}") from e
 
-    # Parse SSE response: "event: message\ndata: {json}"
-    return _parse_sse_response(resp.text)
+        if resp.status_code == 429 or (resp.status_code >= 200 and "RATE_LIMITED" in resp.text):
+            if attempt < retries - 1:
+                wait = 2 ** (attempt + 1)
+                logger.warning(f"Rate limited on {tool_name}, retrying in {wait}s (attempt {attempt+1}/{retries})")
+                _time.sleep(wait)
+                continue
+            else:
+                raise BrokerError(f"Robinhood MCP rate limited after {retries} attempts")
+
+        if resp.status_code == 401:
+            raise BrokerError(
+                "Robinhood MCP auth failed (401). Token may be expired — "
+                "re-run the OAuth flow."
+            )
+        if resp.status_code == 403:
+            raise BrokerError(
+                "Robinhood MCP forbidden (403). Check account permissions."
+            )
+        if resp.status_code >= 400:
+            if attempt < retries - 1:
+                wait = 2 ** (attempt + 1)
+                logger.warning(f"HTTP {resp.status_code} on {tool_name}, retrying in {wait}s")
+                _time.sleep(wait)
+                continue
+            raise BrokerError(
+                f"Robinhood MCP HTTP {resp.status_code}: {resp.text[:500]}"
+            )
+
+        result = _parse_sse_response(resp.text)
+
+        if isinstance(result, dict) and "error" in result:
+            err = result["error"]
+            if "RATE_LIMITED" in str(err) and attempt < retries - 1:
+                wait = 2 ** (attempt + 1)
+                logger.warning(f"Rate limited in response, retrying in {wait}s")
+                _time.sleep(wait)
+                continue
+
+        return result
+
+    raise BrokerError(f"Robinhood MCP failed after {retries} attempts")
 
 
 def _parse_sse_response(raw: str) -> Any:
