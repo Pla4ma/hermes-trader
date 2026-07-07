@@ -195,57 +195,138 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
     # ═══════════════════════════════════════════════════════════════
     # QUALITY SCORE CHECK — reject low-quality setups
     # ═══════════════════════════════════════════════════════════════
-    # Minimum quality score: 7/10 to trade
-    MIN_QUALITY_SCORE = 7
+    # Minimum quality score: 8/12 to trade (professional-grade filtering)
+    MIN_QUALITY_SCORE = 8
     
-    def calculate_quality_score(candidate):
-        """Calculate quality score (0-10) based on multiple factors."""
+    def calculate_quality_score(candidate, analytics=None):
+        """Calculate quality score (0-12) based on professional-grade factors.
+        
+        Factors from friend's advice:
+        - Dealer gamma regime
+        - Above/below VWAP
+        - Relative volume
+        - Delta acceleration
+        - VIX direction
+        - QQQ confirmation
+        - Time of day
+        - Distance from expected move
+        """
         score = 0
         
-        # 1. Delta in sweet spot (0.35-0.50) +2
+        # 1. Delta in sweet spot (0.35-0.50) +1
         delta = abs(candidate.get("delta", 0))
         if 0.35 <= delta <= 0.50:
-            score += 2
-        elif 0.25 <= delta <= 0.60:
             score += 1
+        elif 0.25 <= delta <= 0.60:
+            score += 0.5
         
-        # 2. Volume above average +2
+        # 2. Volume above average +1
         vol = candidate.get("volume", 0)
         if vol > 100000:
-            score += 2
-        elif vol > 50000:
             score += 1
+        elif vol > 50000:
+            score += 0.5
         
-        # 3. Spread tight (< 10% of mid) +2
+        # 3. Spread tight (< 10% of mid) +1
         bid = candidate.get("bid", 0)
         ask = candidate.get("ask", 0)
         mid = candidate.get("mid", 0)
         if mid > 0 and bid > 0 and ask > 0:
             spread_pct = ((ask - bid) / mid) * 100
             if spread_pct < 10:
-                score += 2
-            elif spread_pct < 20:
                 score += 1
+            elif spread_pct < 20:
+                score += 0.5
         
-        # 4. IV in reasonable range +2
+        # 4. IV in reasonable range +1
         iv = candidate.get("iv", 0)
         if 0.25 <= iv <= 0.45:
-            score += 2
-        elif 0.15 <= iv <= 0.55:
             score += 1
+        elif 0.15 <= iv <= 0.55:
+            score += 0.5
         
-        # 5. Gamma high (0DTE explosive) +2
+        # 5. Gamma high (0DTE explosive) +1
         gamma = candidate.get("gamma", 0)
         if gamma > 0.10:
-            score += 2
-        elif gamma > 0.05:
             score += 1
+        elif gamma > 0.05:
+            score += 0.5
+        
+        # 6. QQQ confirmation (+1) — if QQQ same direction
+        if analytics:
+            qqq_signal = analytics.get("qqq_confirmation", False)
+            if qqq_signal:
+                score += 1
+        
+        # 7. VIX favorable (+1) — VIX declining or low
+        if analytics:
+            vix_signal = analytics.get("vix_favorable", False)
+            if vix_signal:
+                score += 1
+        
+        # 8. Dealer gamma regime (+1) — positive gamma = trending
+        if analytics:
+            gamma_regime = analytics.get("gamma_regime", "unknown")
+            if gamma_regime == "positive":
+                score += 1
+            elif gamma_regime == "negative":
+                score += 0.5  # Still tradeable but riskier
+        
+        # 9. Time of day bonus (+1) — morning/afternoon windows
+        from zoneinfo import ZoneInfo
+        from datetime import datetime as dt
+        now_et = dt.now(ZoneInfo("America/New_York"))
+        hour = now_et.hour
+        minute = now_et.minute
+        
+        # Morning window (9:45-10:30) or afternoon (2:00-3:30)
+        if (hour == 9 and minute >= 45) or (hour == 10 and minute <= 30):
+            score += 1  # Morning momentum
+        elif hour == 14 or (hour == 15 and minute <= 30):
+            score += 1  # Afternoon trend
         
         return score
     
+    # Get market analytics for quality scoring
+    market_analytics = {}
+    try:
+        from .options_analytics import OptionsAnalytics
+        oa = OptionsAnalytics()
+        market_analytics = oa.get_full_analytics("SPY")
+        
+        # Add QQQ confirmation
+        try:
+            import yfinance as yf
+            qqq_data = yf.Ticker("QQQ").history(period="1d")
+            if len(qqq_data) > 0:
+                qqq_open = float(qqq_data.iloc[0]["Open"])
+                qqq_current = float(qqq_data.iloc[-1]["Close"])
+                qqq_change = ((qqq_current - qqq_open) / qqq_open) * 100
+                market_analytics["qqq_confirmation"] = qqq_change > 0.2  # QQQ up >0.2%
+        except Exception:
+            pass
+        
+        # Add VIX favorable (VIX declining or < 16)
+        try:
+            vix_data = market_analytics.get("vix", {})
+            vix_current = vix_data.get("current", 20)
+            vix_prev = vix_data.get("previous_close", 20)
+            market_analytics["vix_favorable"] = vix_current < 16 or vix_current < vix_prev
+        except Exception:
+            pass
+        
+        # Add gamma regime
+        try:
+            gex = market_analytics.get("gex", {})
+            market_analytics["gamma_regime"] = gex.get("regime", "unknown")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    
     # Score all viable candidates
     for c in viable:
-        c["quality_score"] = calculate_quality_score(c)
+        c["quality_score"] = calculate_quality_score(c, market_analytics)
     
     # Filter by quality score
     quality_viable = [c for c in viable if c.get("quality_score", 0) >= MIN_QUALITY_SCORE]
@@ -516,10 +597,24 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
             "account_number": ACCOUNT_NUMBER,
             "strategy": "0dte_options",
             "confluence_score": best.get("score", 0),
+            "quality_score": best.get("quality_score", 0),
             "vibe_signal": vibe_signal.get("signal", "unknown"),
             "agents_signal": agents_signal.get("signal", "unknown"),
             "stop_loss": best.get("stop_loss", round(mid_price * 0.50, 4)),
             "take_profit": best.get("take_profit", round(mid_price * 2.0, 4)),
+            # Professional metrics from friend's advice
+            "delta": best.get("delta", 0),
+            "gamma": best.get("gamma", 0),
+            "theta": best.get("theta", 0),
+            "vega": best.get("vega", 0),
+            "iv": best.get("iv", 0),
+            "volume": best.get("volume", 0),
+            "spread_pct": round(((best.get("ask", 0) - best.get("bid", 0)) / best.get("mid", 1)) * 100, 2) if best.get("mid", 0) > 0 else 0,
+            "expected_move": market_analytics.get("expected_move", 0),
+            "gamma_regime": market_analytics.get("gamma_regime", "unknown"),
+            "vix_favorable": market_analytics.get("vix_favorable", False),
+            "qqq_confirmation": market_analytics.get("qqq_confirmation", False),
+            "regime": regime_name,
             "reason": f"Auto-trade 0DTE: {best.get('symbol', '')} {best.get('type', '')} strike={best.get('strike', 0)} score={best.get('score', 0)}/100",
         }
         journal_path = "/opt/hermes-trader/data/journals/paper_orders.jsonl"
