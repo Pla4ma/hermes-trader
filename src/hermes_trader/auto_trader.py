@@ -440,10 +440,15 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
         # Expected move from analytics
         if analytics:
             expected_move = analytics.get("expected_move", 0)
-            if expected_move > 1.0:
-                mag += 0.15
-            elif expected_move > 0.5:
-                mag += 0.08
+            # FIX: expected_move is in DOLLARS (e.g. SPY 12.5 = $12.50 expected move)
+            # Not a 0-1 fraction. Convert to % of spot for comparison.
+            spot_for_move = candidate.get("underlying_price", 0) or candidate.get("spot", 0)
+            if spot_for_move > 0 and expected_move > 0:
+                move_pct = (expected_move / spot_for_move) * 100
+                if move_pct > 1.0:  # >1% expected move
+                    mag += 0.15
+                elif move_pct > 0.5:  # >0.5% expected move
+                    mag += 0.08
         
         # Distance from spot
         spot = candidate.get("underlying_price", 0) or candidate.get("spot", 0)
