@@ -24,7 +24,12 @@ import yfinance as yf
 logger = logging.getLogger("hermes_trader.zero_dte_scanner")
 
 # ── Constants ─────────────────────────────────────────────────
-UNDERLYINGS = ("SPY", "QQQ")
+# Read from config (22 underlyings) instead of hardcoded 2
+try:
+    from .config import config
+    UNDERLYINGS = tuple(sorted(config.allowed_underlyings))
+except Exception:
+    UNDERLYINGS = ("SPY", "QQQ", "IWM", "DIA", "NVDA", "AAPL", "TSLA", "AMD", "META", "AMZN")
 
 # Price filter: only consider options in this premium range ($/contract)
 MIN_PREMIUM_MID = 0.50
