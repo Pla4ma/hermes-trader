@@ -18,7 +18,7 @@ All gates must pass for a trade to execute.
 
 import logging
 from datetime import datetime
-from typing import Tuple
+from typing import Tuple, Optional
 
 logger = logging.getLogger("hermes_trader.entry_gates")
 
@@ -34,9 +34,9 @@ def check_all_gates(
     avg_volume_20d: float,
     rsi_14: float,
     now_et: datetime = None,
-    vwap: float = None,
-    atr_14: float = None,
-    prev_close: float = None,
+    vwap: Optional[float] = None,
+    atr_14: Optional[float] = None,
+    prev_close: Optional[float] = None,
 ) -> Tuple[bool, list[str]]:
     """Run ALL entry gates. Returns (passed, list_of_failures).
 
