@@ -541,7 +541,7 @@ class RobinhoodBrokerAdapter:
                 {
                     "option_id": option_id,
                     "side": side,
-                    "position_effect": "open",
+                    "position_effect": "close" if side == "sell" else "open",
                 }
             ],
             "quantity": quantity,

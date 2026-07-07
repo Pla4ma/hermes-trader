@@ -484,7 +484,8 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
             avg_volume = float(hist_20d["Volume"].mean())
             
             # Get previous close for gap detection
-            prev_close = float(hist_20d["Close"].iloc[-1]) if len(hist_20d) > 0 else 0
+            # Use iloc[-2] for yesterday's close (iloc[-1] includes today's partial bar)
+            prev_close = float(hist_20d["Close"].iloc[-2]) if len(hist_20d) > 1 else 0
             
             # Calculate VWAP (intraday volume-weighted average price)
             try:
@@ -592,7 +593,7 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
             pass
 
         sizing_rec = sizer.recommend(
-            win_prob=0.55,  # Default win rate for 0DTE
+            win_prob=best.get("probability", 0.55),  # Use actual probability from dual model
             avg_win=0.50,   # Target 50% avg win
             avg_loss=0.50,  # Stop at 50% loss
             premium_per_contract=mid_price,

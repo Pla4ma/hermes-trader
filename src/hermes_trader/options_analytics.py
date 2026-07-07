@@ -158,7 +158,21 @@ class OptionsAnalytics:
 
         # Simplified max pain (using strike density)
         if strikes:
-            max_pain_strike = max(strikes.keys(), key=lambda s: abs(s - self.spy_price))
+            # Max pain = strike where total pain (call OI + put OI) is minimized
+            # Pain for each strike = sum of all OTM options that would be ITM
+            def calculate_pain(test_strike):
+                total_pain = 0
+                for strike, data in strikes.items():
+                    # Call pain: if stock > strike, call holders profit
+                    if test_strike > strike:
+                        total_pain += data["call_oi"] * (test_strike - strike)
+                    # Put pain: if stock < strike, put holders profit
+                    if test_strike < strike:
+                        total_pain += data["put_oi"] * (strike - test_strike)
+                return total_pain
+            
+            # Find strike with minimum total pain
+            max_pain_strike = min(strikes.keys(), key=calculate_pain)
         else:
             max_pain_strike = self.spy_price
 

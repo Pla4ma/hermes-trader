@@ -60,7 +60,12 @@ def check_all_gates(
         (False, [reason1, reason2, ...]) if ANY gate fails
     """
     if now_et is None:
-        now_et = datetime.utcnow()
+        # Default to ET time, not UTC
+        try:
+            from zoneinfo import ZoneInfo
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+        except Exception:
+            now_et = datetime.utcnow()
 
     failures = []
 
