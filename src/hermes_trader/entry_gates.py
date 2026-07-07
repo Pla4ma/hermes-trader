@@ -34,6 +34,9 @@ def check_all_gates(
     avg_volume_20d: float,
     rsi_14: float,
     now_et: datetime = None,
+    vwap: float = None,
+    atr_14: float = None,
+    prev_close: float = None,
 ) -> Tuple[bool, list[str]]:
     """Run ALL entry gates. Returns (passed, list_of_failures).
 
@@ -48,6 +51,9 @@ def check_all_gates(
         avg_volume_20d: 20-day average volume
         rsi_14: Current RSI(14)
         now_et: Current time (Eastern), defaults to now
+        vwap: Volume Weighted Average Price (optional)
+        atr_14: Average True Range over 14 periods (optional)
+        prev_close: Previous session close (optional)
 
     Returns:
         (True, []) if ALL gates pass
@@ -87,6 +93,24 @@ def check_all_gates(
     passed, reason = gate_rsi(rsi_14, option_type)
     if not passed:
         failures.append(reason)
+    
+    # Gate 7: VWAP Chop (price chopping around VWAP = no trade)
+    if vwap is not None:
+        passed, reason = gate_vwap_chop(spot, vwap, option_type)
+        if not passed:
+            failures.append(reason)
+    
+    # Gate 8: ATR Low (low volatility = skip)
+    if atr_14 is not None and open_price > 0:
+        passed, reason = gate_atr_low(atr_14, open_price)
+        if not passed:
+            failures.append(reason)
+    
+    # Gate 9: Gap Fade Risk (large gap up = risk of fade)
+    if prev_close is not None and prev_close > 0:
+        passed, reason = gate_gap_fade(spot, prev_close, option_type)
+        if not passed:
+            failures.append(reason)
 
     if failures:
         logger.warning(f"ENTRY BLOCKED for {symbol} {option_type}: {failures}")
@@ -264,4 +288,71 @@ def gate_rsi(rsi_14: float, option_type: str) -> Tuple[bool, str]:
         if rsi_14 < 32:
             return False, f"RSI GATE: Puts blocked — RSI {rsi_14:.1f} < 32 (oversold, likely to bounce)"
 
+    return True, ""
+
+
+def gate_vwap_chop(spot: float, vwap: float, option_type: str) -> Tuple[bool, str]:
+    """Gate 7: Price chopping around VWAP = no trade.
+    
+    If price is within 0.1% of VWAP, it's consolidating/chopping.
+    Chopping markets have no clear direction — don't trade.
+    
+    For CALLS: Spot must be clearly above VWAP (>0.1%)
+    For PUTS: Spot must be clearly below VWAP (>0.1%)
+    """
+    if vwap <= 0:
+        return True, ""
+    
+    vwap_distance_pct = ((spot - vwap) / vwap) * 100
+    
+    if option_type == "call":
+        if abs(vwap_distance_pct) < 0.1:
+            return False, f"VWAP CHOP GATE: Calls blocked — SPY within 0.1% of VWAP (chopping, no direction)"
+    elif option_type == "put":
+        if abs(vwap_distance_pct) < 0.1:
+            return False, f"VWAP CHOP GATE: Puts blocked — SPY within 0.1% of VWAP (chopping, no direction)"
+    
+    return True, ""
+
+
+def gate_atr_low(atr_14: float, open_price: float) -> Tuple[bool, str]:
+    """Gate 8: Low ATR = skip trading.
+    
+    ATR measures volatility. If ATR is too low relative to price,
+    the market is too quiet for 0DTE options to be profitable.
+    
+    Threshold: ATR should be > 0.3% of price for 0DTE trading.
+    """
+    if open_price <= 0:
+        return True, ""
+    
+    atr_pct = (atr_14 / open_price) * 100
+    
+    if atr_pct < 0.3:
+        return False, f"ATR LOW GATE: Skipped — ATR only {atr_pct:.2f}% of price (need >0.3%, market too quiet)"
+    
+    return True, ""
+
+
+def gate_gap_fade(spot: float, prev_close: float, option_type: str) -> Tuple[bool, str]:
+    """Gate 9: Large gap = risk of fade.
+    
+    If SPY gapped up >0.5% overnight, there's a high probability
+    of a fade (pullback) during the day. Don't buy calls into a gap.
+    
+    For CALLS: Block if gap up >0.5% (fade risk)
+    For PUTS: Block if gap down >0.5% (bounce risk)
+    """
+    if prev_close <= 0:
+        return True, ""
+    
+    gap_pct = ((spot - prev_close) / prev_close) * 100
+    
+    if option_type == "call":
+        if gap_pct > 0.5:
+            return False, f"GAP FADE GATE: Calls blocked — SPY gapped up {gap_pct:.2f}% (high fade risk)"
+    elif option_type == "put":
+        if gap_pct < -0.5:
+            return False, f"GAP FADE GATE: Puts blocked — SPY gapped down {gap_pct:.2f}% (high bounce risk)"
+    
     return True, ""

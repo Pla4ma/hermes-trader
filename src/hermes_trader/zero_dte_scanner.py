@@ -41,8 +41,8 @@ W_SPREAD = 20   # Narrower bid/ask = less slippage
 W_IV = 10       # Moderate IV is best for long options
 
 # Ideal parameter ranges
-IDEAL_DELTA_LOW = 0.20
-IDEAL_DELTA_HIGH = 0.40
+IDEAL_DELTA_LOW = 0.35
+IDEAL_DELTA_HIGH = 0.50
 IDEAL_IV_LOW = 0.25    # 25% annualized
 IDEAL_IV_HIGH = 0.45   # 45% annualized
 

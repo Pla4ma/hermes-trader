@@ -191,8 +191,71 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
     if not viable:
         result["reason"] = f"No 0DTE candidates above {min_score}/100 threshold"
         return result
-
-    best = viable[0]
+    
+    # ═══════════════════════════════════════════════════════════════
+    # QUALITY SCORE CHECK — reject low-quality setups
+    # ═══════════════════════════════════════════════════════════════
+    # Minimum quality score: 7/10 to trade
+    MIN_QUALITY_SCORE = 7
+    
+    def calculate_quality_score(candidate):
+        """Calculate quality score (0-10) based on multiple factors."""
+        score = 0
+        
+        # 1. Delta in sweet spot (0.35-0.50) +2
+        delta = abs(candidate.get("delta", 0))
+        if 0.35 <= delta <= 0.50:
+            score += 2
+        elif 0.25 <= delta <= 0.60:
+            score += 1
+        
+        # 2. Volume above average +2
+        vol = candidate.get("volume", 0)
+        if vol > 100000:
+            score += 2
+        elif vol > 50000:
+            score += 1
+        
+        # 3. Spread tight (< 10% of mid) +2
+        bid = candidate.get("bid", 0)
+        ask = candidate.get("ask", 0)
+        mid = candidate.get("mid", 0)
+        if mid > 0 and bid > 0 and ask > 0:
+            spread_pct = ((ask - bid) / mid) * 100
+            if spread_pct < 10:
+                score += 2
+            elif spread_pct < 20:
+                score += 1
+        
+        # 4. IV in reasonable range +2
+        iv = candidate.get("iv", 0)
+        if 0.25 <= iv <= 0.45:
+            score += 2
+        elif 0.15 <= iv <= 0.55:
+            score += 1
+        
+        # 5. Gamma high (0DTE explosive) +2
+        gamma = candidate.get("gamma", 0)
+        if gamma > 0.10:
+            score += 2
+        elif gamma > 0.05:
+            score += 1
+        
+        return score
+    
+    # Score all viable candidates
+    for c in viable:
+        c["quality_score"] = calculate_quality_score(c)
+    
+    # Filter by quality score
+    quality_viable = [c for c in viable if c.get("quality_score", 0) >= MIN_QUALITY_SCORE]
+    result["quality_candidates"] = len(quality_viable)
+    
+    if not quality_viable:
+        result["reason"] = f"No candidates with quality score ≥{MIN_QUALITY_SCORE}/10"
+        return result
+    
+    best = quality_viable[0]
 
     # ═══════════════════════════════════════════════════════════════
     # ENTRY GATE FILTERS — BLOCKS bad entries (the #1 lesson)
@@ -223,6 +286,36 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
             low_of_day = float(today_data["Low"])
             current_volume = float(hist_today["Volume"].iloc[-1])
             avg_volume = float(hist_20d["Volume"].mean())
+            
+            # Get previous close for gap detection
+            prev_close = float(hist_20d["Close"].iloc[-1]) if len(hist_20d) > 0 else 0
+            
+            # Calculate VWAP (intraday volume-weighted average price)
+            try:
+                intraday = ticker.history(period="1d", interval="1m")
+                if len(intraday) > 0:
+                    typical_price = (intraday["High"] + intraday["Low"] + intraday["Close"]) / 3
+                    vwap = (typical_price * intraday["Volume"]).sum() / intraday["Volume"].sum()
+                else:
+                    vwap = None
+            except Exception:
+                vwap = None
+            
+            # Calculate ATR (Average True Range)
+            try:
+                if len(hist_20d) >= 14:
+                    high = hist_20d["High"]
+                    low = hist_20d["Low"]
+                    close = hist_20d["Close"].shift(1)
+                    tr = high - low
+                    tr2 = abs(high - close)
+                    tr3 = abs(low - close)
+                    atr = (tr + tr2 + tr3) / 3
+                    atr_14 = float(atr.rolling(14).mean().iloc[-1])
+                else:
+                    atr_14 = None
+            except Exception:
+                atr_14 = None
 
             # RSI calculation
             close_20d = hist_20d["Close"]
@@ -250,6 +343,9 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
                 avg_volume_20d=avg_volume,
                 rsi_14=rsi_14,
                 now_et=now_et,
+                vwap=vwap,
+                atr_14=atr_14,
+                prev_close=prev_close,
             )
 
             result["entry_gates"] = {
