@@ -10,7 +10,7 @@ import pytest
 
 from hermes_trader.options_flow import (
     DEFAULT_VOLUME_MULTIPLIER,
-    MIN_SWEEP_MIN_SIZE,
+    MIN_SWEEP_SIZE,
     MIN_SWEEP_PREMIUM,
     AGGRESSIVE_FILL_THRESHOLD,
     MIN_VOLUME_FLOOR,
@@ -138,7 +138,7 @@ class TestDetectSweeps:
             [_make_call_row(vol=50, last=1.48, ask=1.50, bid=0.80)],  # < 100
             [],
         )
-        _patch_yfinance(monkeypass := monkeypatch, chain_factory=lambda: chain)
+        _patch_yfinance(monkeypatch, chain_factory=lambda: chain)
         sweeps = OptionsFlowDetector().detect_sweeps("SPY", max_dte=1)
         # vol=50 < MIN_SWEEP_SIZE=100 → should be excluded
         assert all(s.volume >= MIN_SWEEP_SIZE for s in sweeps)
@@ -171,8 +171,8 @@ class TestPutCallFlow:
 
     def test_equal_flow(self, monkeypatch):
         chain = _mock_option_chain(
-            [_make_call_row(vol=100, last=1.0)],
-            [_make_put_row(vol=100, last=1.0)],
+            [_make_call_row(vol=100, last=1.0, bid=1.0, ask=1.0)],
+            [_make_put_row(vol=100, last=1.0, bid=1.0, ask=1.0)],
         )
         _patch_yfinance(monkeypatch, chain_factory=lambda: chain)
         flow = calculate_put_call_flow("SPY", max_dte=1)
