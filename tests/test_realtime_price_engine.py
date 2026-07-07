@@ -144,8 +144,7 @@ class TestDetectionEngine:
 
         async def run():
             bus = TickBus()
-            det = DetectionEngine(bus=bus, on_signal=handler, on_signal=None)  # type: ignore
-            det._on_signal = handler
+            det = DetectionEngine(bus=bus, on_signal=handler)  # type: ignore
             det._cooldown_s = 5.0
             await det.start()
             try:

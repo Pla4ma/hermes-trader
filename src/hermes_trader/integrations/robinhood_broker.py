@@ -484,12 +484,14 @@ class RobinhoodBrokerAdapter:
 
     def list_positions(self) -> list[dict]:
         """Return all open positions as dicts (for auto_trader compatibility)."""
+        all_positions = []
+        # Get equity positions
         try:
             data = robinhood_mcp_call("get_equity_positions", {
                 "account_number": ROBINHOOD_ACCOUNT,
             })
             positions = _parse_positions(data)
-            return [
+            all_positions.extend([
                 {
                     "symbol": p.symbol,
                     "quantity": p.qty,
@@ -499,12 +501,37 @@ class RobinhoodBrokerAdapter:
                     "unrealized_plpc": p.unrealized_plpc,
                     "avg_entry_price": p.cost_basis / p.qty if p.qty > 0 else 0,
                     "current_price": p.market_value / p.qty if p.qty > 0 else 0,
+                    "asset_type": "equity",
                 }
                 for p in positions
-            ]
+            ])
         except BrokerError as e:
             logger.error(f"list_positions failed: {e}")
-            return []
+        
+        # Get option positions
+        try:
+            opt_data = robinhood_mcp_call("get_option_positions", {
+                "account_number": ROBINHOOD_ACCOUNT,
+                "nonzero": True,
+            })
+            for p in (opt_data.get("positions", []) if opt_data else []):
+                qty = float(p.get("quantity", 0) or 0)
+                if qty > 0:
+                    all_positions.append({
+                        "symbol": p.get("chain_symbol", "UNKNOWN"),
+                        "option_id": p.get("option_id", ""),
+                        "type": p.get("type", "call"),
+                        "strike": float(p.get("strike_price", 0) or 0),
+                        "expiration": p.get("expiration_date", ""),
+                        "quantity": qty,
+                        "avg_entry_price": float(p.get("average_price", 0) or 0),
+                        "current_price": float(p.get("mark_price", 0) or float(p.get("last_price", 0) or 0)),
+                        "asset_type": "option",
+                    })
+        except BrokerError as e:
+            logger.warning(f"get_option_positions failed: {e}")
+        
+        return all_positions
 
     def list_open_orders(self) -> list[dict]:
         """Return current open orders as dicts (for auto_trader compatibility)."""

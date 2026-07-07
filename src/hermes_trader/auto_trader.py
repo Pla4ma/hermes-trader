@@ -892,9 +892,9 @@ def manage_exits() -> dict:
             continue
 
         pnl_pct = (current / entry - 1) * 100 if entry > 0 else 0
-
+        
         # ── Trailing stop logic for options ──
-        if pnl_pct >= 50:
+        if pnl_pct >= 30:
             # Tighten stop to trail by 20% (for high-vol options)
             new_sl = round(current * 0.80, 4)
             old_sl = round(entry * 0.50, 4)
