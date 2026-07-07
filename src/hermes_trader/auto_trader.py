@@ -27,6 +27,11 @@ from .portfolio_risk import (
     get_portfolio_risk_summary, calculate_portfolio_correlation
 )
 
+# ── MAX POWER Tier 1 features (VIX term structure, cross-asset, microstructure) ──
+from .vol_regime import fetch_vol_regime, should_trade_today as vol_should_trade, get_size_multiplier as vol_size_mult
+from .correlation_regime import compute_correlation_regime, CorrelationRegime
+from .microstructure_signals import compute_microstructure, get_aggregate_pressure
+
 # ── Simple yfinance cache (60s TTL) ──
 _yf_cache = {}
 _yf_cache_ttl = 60  # seconds
@@ -191,6 +196,31 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
                 "reason": f"Economic event: {'; '.join(block_reasons)}",
                 "analytics": analytics,
                 "event_summary": format_event_summary(),
+            }
+    except Exception:
+        pass
+    
+    # ─── VIX Term Structure Check (MAX POWER — #1 documented edge) ───
+    try:
+        should_trade, vol_reason = vol_should_trade()
+        if not should_trade:
+            return {
+                "action": "blocked",
+                "reason": f"Vol regime: {vol_reason}",
+                "analytics": analytics,
+            }
+    except Exception:
+        pass
+    
+    # ─── Cross-Asset Correlation Check (MAX POWER) ───
+    try:
+        corr_regime = compute_correlation_regime()
+        if corr_regime and corr_regime.should_block_trades():
+            return {
+                "action": "blocked",
+                "reason": f"Correlation regime CRASH_RISK: {corr_regime.notes}",
+                "analytics": analytics,
+                "correlation_regime": corr_regime.regime,
             }
     except Exception:
         pass
