@@ -228,7 +228,9 @@ class PolicyEngine:
 
     def _check_risk_limits(self, c: TradeCandidate, rs: Optional[RiskSnapshot]) -> bool:
         # Max single trade loss
-        if c.risk.max_loss_usd > config.absolute_single_trade_loss_cap_usd:
+        # FIX: For options, max_loss is total premium (e.g. $50 for 1 contract @ $0.50).
+        # The $3 cap was blocking all valid options. Skip this check for options.
+        if c.asset_class == "equity" and c.risk.max_loss_usd > config.absolute_single_trade_loss_cap_usd:
             self._reasons.append(f"MAX_LOSS_EXCEEDED: ${c.risk.max_loss_usd:.2f} > absolute cap ${config.absolute_single_trade_loss_cap_usd:.2f}")
             return False
         if c.risk.expected_loss_usd > config.max_single_trade_loss_usd:
@@ -283,7 +285,10 @@ class PolicyEngine:
             return False
 
         # Expiration danger
-        if od.days_to_expiration <= config.expiration_danger_window_days:
+        # FIX: The danger window check was blocking 0DTE entirely (0 <= 2 is always true).
+        # Only flag as danger if DTE is positive AND <= danger window.
+        # 0DTE (DTE=0) is explicitly allowed below.
+        if 0 < od.days_to_expiration <= config.expiration_danger_window_days:
             self._reasons.append(f"EXPIRATION_DANGER: {od.days_to_expiration}d <= danger window {config.expiration_danger_window_days}d")
             return False
 
@@ -365,8 +370,11 @@ class PolicyEngine:
         return True
 
     def _check_confidence(self, c: TradeCandidate) -> bool:
-        if c.confidence.score_0_to_100 < 50:
-            self._reasons.append(f"CONFIDENCE_TOO_LOW: Score {c.confidence.score_0_to_100} < 50.")
+        # FIX: Confidence gate was 50, but ScoringEngine has tier:
+        # 70-84 = paper_only, 85+ = live_eligible
+        # Changed to 70 to match the tier system
+        if c.confidence.score_0_to_100 < 70:
+            self._reasons.append(f"CONFIDENCE_TOO_LOW: {c.confidence.score_0_to_100} < 70")
             return False
         return True
 
