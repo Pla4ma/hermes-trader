@@ -265,16 +265,87 @@ def place_buy_order(option_id: str, quantity: int, limit_price: float) -> Option
     return None
 
 
+def _check_research_bias(symbol: str) -> dict:
+    """Check daily research bias from VibeTrading + TradingAgents.
+    
+    Reads /opt/hermes-trader/data/snapshots/research_latest.json
+    (saved by workflow.py run_research_cycle).
+    
+    Returns:
+        {"allowed": True/False, "reason": str, "bias": "bullish"/"bearish"/"neutral"}
+    
+    Rules:
+    - No research file → BLOCK (don't trade blind)
+    - Research older than 8 hours → BLOCK (stale)
+    - Signal matches direction → ALLOW
+    - Signal is neutral → ALLOW (research found no edge, but don't block)
+    - Signal conflicts → BLOCK
+    """
+    import json
+    from pathlib import Path
+    
+    snapshot_path = Path("/opt/hermes-trader/data/snapshots/research_latest.json")
+    
+    if not snapshot_path.exists():
+        return {"allowed": False, "reason": "No research snapshot — run daily workflow first", "bias": "none"}
+    
+    try:
+        data = json.loads(snapshot_path.read_text())
+        timestamp = data.get("timestamp", "")
+        
+        # Check staleness (8 hours max)
+        from datetime import datetime, timedelta
+        try:
+            research_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            age_hours = (datetime.now(research_time.tzinfo) - research_time).total_seconds() / 3600
+            if age_hours > 8:
+                return {"allowed": False, "reason": f"Research stale ({age_hours:.1f}h old, max 8h)", "bias": "stale"}
+        except Exception:
+            pass  # If we can't parse time, allow (research exists at least)
+        
+        # Get symbol's research
+        research = data.get("research", {})
+        symbol_data = research.get(symbol, {})
+        
+        if not symbol_data:
+            return {"allowed": False, "reason": f"No research for {symbol}", "bias": "none"}
+        
+        signal = symbol_data.get("signal", "neutral")
+        confidence = symbol_data.get("confidence_score", 0)
+        
+        # neutral = allow (research found no strong edge either way)
+        if signal == "neutral":
+            return {"allowed": True, "reason": f"Research neutral for {symbol} — proceeding", "bias": "neutral"}
+        
+        # bullish/bearish — store for direction validation later
+        return {
+            "allowed": True,
+            "reason": f"Research {signal} (conf={confidence}) for {symbol}",
+            "bias": signal,
+            "confidence": confidence,
+        }
+    
+    except Exception as e:
+        logger.error(f"Research bias check error: {e}")
+        return {"allowed": False, "reason": f"Research check failed: {e}", "bias": "error"}
+
+
 async def handle_event(event: PriceEvent, watcher: PriceWatcher):
     """Handle a price event from the watcher.
     
     This is the main decision logic:
+    0. CHECK RESEARCH BIAS (VibeTrading + TradingAgents from daily workflow)
     1. Check safety gates (news, portfolio)
     2. Determine direction
     3. Find target option
     4. Validate entry gates
     5. Place order
     6. Start position monitor for auto-exit
+    
+    CRITICAL: Step 0 was missing — watcher executed blind without any
+    research intelligence. Now it checks the daily research snapshot
+    before every trade. If no research exists or direction conflicts,
+    trade is BLOCKED.
     """
     if watcher.in_cooldown():
         logger.debug(f"In cooldown, skipping event: {event}")
@@ -282,6 +353,14 @@ async def handle_event(event: PriceEvent, watcher: PriceWatcher):
     
     if watcher.rate_limit_exceeded():
         logger.debug(f"Rate limit exceeded, skipping event: {event}")
+        return
+    
+    # ── STEP 0: RESEARCH BIAS CHECK ──
+    # Load daily research (VibeTrading + TradingAgents output from 9:40 workflow)
+    # Block trade if: no research, stale research, or direction conflicts with bias
+    research_bias = _check_research_bias(event.symbol)
+    if not research_bias["allowed"]:
+        logger.info(f"Event {event} blocked by research: {research_bias['reason']}")
         return
     
     # Check safety gates

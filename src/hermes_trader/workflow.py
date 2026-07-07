@@ -212,7 +212,20 @@ class DailyWorkflow:
                 "confidence_score": agents_result.get("confidence", 0),
             }
 
-        return {"status": "COMPLETED", "timestamp": datetime.utcnow().isoformat(), "research": research}
+        result = {"status": "COMPLETED", "timestamp": datetime.utcnow().isoformat(), "research": research}
+        
+        # Save research snapshot for watcher/trigger_engine to consume
+        try:
+            import json
+            snapshot_dir = Path("/opt/hermes-trader/data/snapshots")
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
+            snapshot_path = snapshot_dir / "research_latest.json"
+            snapshot_path.write_text(json.dumps(result, default=str, indent=2))
+            logger.info(f"Research snapshot saved to {snapshot_path}")
+        except Exception as e:
+            logger.error(f"Failed to save research snapshot: {e}")
+        
+        return result
 
     def run(self, research_result: Optional[dict] = None) -> dict:
         """Run the full daily cycle.
