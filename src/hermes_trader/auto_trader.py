@@ -20,6 +20,13 @@ from typing import Optional
 logger = logging.getLogger("hermes_trader.auto_trader")
 ACCOUNT_NUMBER = os.getenv("ROBINHOOD_ACCOUNT_NUMBER", "924058324")
 
+# ── New modules (MAX POWER upgrade) ──
+from .news_catalyst import should_block_trade, get_position_size_multiplier, format_event_summary
+from .portfolio_risk import (
+    check_concentration_risk, check_drawdown, kelly_with_portfolio_constraint,
+    get_portfolio_risk_summary, calculate_portfolio_correlation
+)
+
 # ── Simple yfinance cache (60s TTL) ──
 _yf_cache = {}
 _yf_cache_ttl = 60  # seconds
@@ -172,6 +179,39 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
         earnings = check_earnings("SPY")
         if earnings.get("in_danger_zone"):
             return {"action": "wait", "reason": "SPY earnings in danger zone", "analytics": analytics}
+    except Exception:
+        pass
+    
+    # ─── News/Catalyst Check (MAX POWER) ───
+    try:
+        block_reasons = []
+        if should_block_trade(block_reasons):
+            return {
+                "action": "blocked",
+                "reason": f"Economic event: {'; '.join(block_reasons)}",
+                "analytics": analytics,
+                "event_summary": format_event_summary(),
+            }
+    except Exception:
+        pass
+    
+    # ─── Portfolio Risk Check (MAX POWER) ───
+    try:
+        positions = broker.list_positions()
+        position_dicts = [
+            {"symbol": p.symbol, "type": "call", "value": float(p.quantity) * float(p.avg_entry_price) * 100}
+            for p in positions if hasattr(p, "quantity")
+        ]
+        portfolio_value = float(account.cash) + sum(p.get("value", 0) for p in position_dicts)
+        
+        risk_summary = get_portfolio_risk_summary(position_dicts)
+        if not risk_summary.get("can_trade", True):
+            return {
+                "action": "blocked",
+                "reason": risk_summary.get("drawdown_reason", "Portfolio risk limit"),
+                "analytics": analytics,
+                "risk_summary": risk_summary,
+            }
     except Exception:
         pass
 
