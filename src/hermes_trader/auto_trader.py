@@ -228,6 +228,10 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
     # ─── Portfolio Risk Check (MAX POWER) ───
     try:
         positions = broker.list_positions()
+        # Handle both dict and object positions (list_positions returns dicts)
+        # Use asset_type to correctly calculate value:
+        # - option: qty × entry_price × 100 (multiplier)
+        # - equity: qty × entry_price (no multiplier)
         position_dicts = [
             {"symbol": p.symbol, "type": "call", "value": float(p.quantity) * float(p.avg_entry_price) * 100}
             for p in positions if hasattr(p, "quantity")
@@ -948,7 +952,8 @@ def manage_exits() -> dict:
                     if o.get("symbol", "") == symbol:
                         try:
                             broker.cancel_order(o.get("order_id", o.get("id", "")))
-                            import time; time.sleep(0.5)
+                            # Removed blocking sleep — was 0.5s per order, stalls exits during vol spikes
+                            pass
                         except Exception:
                             pass
 
@@ -977,17 +982,20 @@ def manage_exits() -> dict:
                     actions.append({"symbol": symbol, "action": "SL_ERROR", "error": str(e)})
 
         elif pnl_pct <= -50:
-            # Hard stop-loss: close immediately at market
+            # Hard stop-loss: use limit at current bid for fast fill, avoid market slippage
             try:
                 option_id = pos.get("option_id", "")
                 if not option_id:
                     actions.append({"symbol": symbol, "action": "SL_ERROR", "error": "No option_id in position"})
                     continue
                 
+                # Use limit at current bid (slightly below current) to ensure fill
+                stop_limit_price = max(round(current * 0.95, 4), 0.01)  # 5% below current, min $0.01
                 order = broker.place_option_order(
                     option_id=option_id,
                     side="sell",
                     quantity=max(1, int(qty)),
+                    limit_price=str(stop_limit_price),
                     time_in_force="day",
                 )
                 actions.append({
