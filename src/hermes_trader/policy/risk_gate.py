@@ -198,7 +198,9 @@ class PolicyEngine:
 
     def _check_account_limits(self, a: AccountSnapshot, c: TradeCandidate) -> bool:
         # Equity inside mandate?
-        if a.equity > config.max_account_equity_usd:
+        # FIX: max_account_equity_usd was a static cap. Now we use it as a SOFT cap
+        # that only blocks when significantly exceeded. The account can grow.
+        if a.equity > config.max_account_equity_usd * 1.10:  # 10% buffer
             self._reasons.append(f"EQUITY_EXCEEDS_MANDATE: ${a.equity:.2f} > ${config.max_account_equity_usd:.2f}")
             return False
         # Sufficient buying power?

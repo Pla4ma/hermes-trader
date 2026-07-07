@@ -254,7 +254,19 @@ class Config:
         Phase 2: $100 → $500 (growth, 3% risk, 2-3 positions)
         Phase 3: $500 → $2000 (scaling, 4% risk, 3-4 positions)
         """
-        equity = self.max_account_equity_usd
+        # FIX: was using static max_account_equity_usd. Now we use the actual
+        # equity by getting it from the broker if available, or fall back to max.
+        try:
+            from .integrations.robinhood_broker import RobinhoodBrokerAdapter
+            broker = RobinhoodBrokerAdapter()
+            account = broker.get_account()
+            if hasattr(account, 'equity') and account.equity > 0:
+                equity = float(account.equity)
+            else:
+                equity = self.max_account_equity_usd
+        except Exception:
+            equity = self.max_account_equity_usd
+        
         if equity < self.small_account_phase_2_equity:
             return 1
         elif equity < self.small_account_phase_3_equity:
