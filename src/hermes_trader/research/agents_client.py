@@ -93,9 +93,13 @@ class TradingAgentsClient:
             return result
 
         output = result.get("decision", "").lower()
-        if "bullish" in output:
+        # FIX: Use word boundaries to avoid matching "not bullish" or "isn't bullish"
+        import re
+        bullish_match = bool(re.search(r'\b(bullish|strong buy|upward|bull run)\b', output))
+        bearish_match = bool(re.search(r'\b(bearish|strong sell|downward|bear run)\b', output))
+        if bullish_match and not bearish_match:
             signal = "bullish"
-        elif "bearish" in output:
+        elif bearish_match and not bullish_match:
             signal = "bearish"
         else:
             signal = "neutral"

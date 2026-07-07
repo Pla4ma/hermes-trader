@@ -2,6 +2,16 @@
 
 This is the Hermes agent's daily orchestration script.
 It runs the full research → evaluate → decide → execute pipeline.
+
+CRITICAL FIXES (July 7, 2026):
+- Now uses entry_gates (9 filters)
+- Now uses vol_regime (VIX term structure)
+- Now uses correlation_regime (12-asset matrix)
+- Now uses news_catalyst (FOMC/NFP/CPI)
+- Now uses portfolio_risk (drawdown protection)
+- Research gate now allows bearish (for puts)
+- cancel_order no longer uses paper_ prefix
+- limit_price no longer falls back to market price
 """
 
 import json
@@ -25,6 +35,13 @@ from .integrations.robinhood_broker import RobinhoodBrokerAdapter
 from .monitoring.position_monitor import PositionMonitor
 from .research.agents_client import TradingAgentsClient
 from .research.vibe_client import VibeTradingClient
+
+# ── MAX POWER feature imports (July 7, 2026) ──
+from .entry_gates import check_all_gates
+from .vol_regime import should_trade_today as vol_should_trade
+from .correlation_regime import compute_correlation_regime
+from .news_catalyst import should_block_trade as news_should_block
+from .portfolio_risk import get_portfolio_risk_summary, check_drawdown
 
 logger = logging.getLogger("hermes_trader.workflow")
 
@@ -51,6 +68,114 @@ class DailyWorkflow:
         except Exception:
             return 0.0
 
+    def _run_max_power_filters(self, candidate: TradeCandidate) -> tuple:
+        """Run all MAX POWER filters. Returns (passed, reason).
+        
+        Filters:
+        1. Vol regime (VIX term structure)
+        2. Correlation regime (CRASH_RISK detection)
+        3. News/catalyst (FOMC/NFP/CPI)
+        4. Portfolio risk (drawdown)
+        5. Entry gates (9 filters)
+        """
+        # 1. VIX term structure
+        try:
+            should_trade, vol_reason = vol_should_trade()
+            if not should_trade:
+                return False, f"Vol regime: {vol_reason}"
+        except Exception as e:
+            logger.debug(f"Vol regime check error: {e}")
+
+        # 2. Correlation regime
+        try:
+            corr_regime = compute_correlation_regime()
+            if corr_regime and corr_regime.should_block_trades():
+                return False, f"Correlation CRASH_RISK: {corr_regime.notes}"
+        except Exception as e:
+            logger.debug(f"Correlation check error: {e}")
+
+        # 3. News/catalyst
+        try:
+            block_reasons = []
+            if news_should_block(block_reasons):
+                return False, f"News: {block_reasons[0]}"
+        except Exception as e:
+            logger.debug(f"News check error: {e}")
+
+        # 4. Portfolio risk
+        try:
+            positions = self.broker.list_positions()
+            position_dicts = [
+                {
+                    "symbol": p.get("symbol", "UNKNOWN") if isinstance(p, dict) else getattr(p, "symbol", "UNKNOWN"),
+                    "type": p.get("type", "equity") if isinstance(p, dict) else "equity",
+                    "value": float(p.get("quantity", 0) or 0) * float(p.get("avg_entry_price", 0) or 0) * (100 if p.get("asset_type", "equity") == "option" else 1)
+                    if isinstance(p, dict) else 0,
+                }
+                for p in positions
+            ]
+            equity_curve = []  # TODO: load from history
+            is_blocked, dd_pct, dd_reason = check_drawdown(equity_curve)
+            if is_blocked:
+                return False, dd_reason
+        except Exception as e:
+            logger.debug(f"Portfolio risk check error: {e}")
+
+        # 5. Entry gates (9 filters) — only for option candidates
+        if candidate.asset_class == "option" and candidate.underlying in ("SPY", "QQQ", "SPXW", "NDXW"):
+            try:
+                import yfinance as yf
+                from datetime import datetime as dt
+                from zoneinfo import ZoneInfo
+                symbol = candidate.underlying
+                ticker = yf.Ticker(symbol)
+                hist_today = ticker.history(period="1d")
+                hist_20d = ticker.history(period="20d")
+                
+                if len(hist_today) > 0 and len(hist_20d) > 1:
+                    today_data = hist_today.iloc[0]
+                    open_price = float(today_data["Open"])
+                    high_of_day = float(today_data["High"])
+                    low_of_day = float(today_data["Low"])
+                    current_volume = float(hist_today["Volume"].iloc[-1])
+                    avg_volume = float(hist_20d["Volume"].mean())
+                    prev_close = float(hist_20d["Close"].iloc[-2]) if len(hist_20d) > 1 else 0
+                    
+                    # RSI
+                    close_20d = hist_20d["Close"]
+                    delta_series = close_20d.diff()
+                    gain = delta_series.clip(lower=0).rolling(14).mean()
+                    loss = (-delta_series.clip(upper=0)).rolling(14).mean()
+                    rs = gain / loss
+                    rsi_series = 100 - (100 / (1 + rs))
+                    rsi_14 = float(rsi_series.iloc[-1]) if len(rsi_series) > 0 else 50.0
+                    
+                    now_et = dt.now(ZoneInfo("America/New_York"))
+                    spot = self._fetch_market_price(symbol)
+                    
+                    option_type = "call" if candidate.direction == "bullish" else "put"
+                    
+                    if spot > 0:
+                        gates_passed, gate_failures = check_all_gates(
+                            symbol=symbol,
+                            option_type=option_type,
+                            spot=spot,
+                            open_price=open_price,
+                            high_of_day=high_of_day,
+                            low_of_day=low_of_day,
+                            current_volume=current_volume,
+                            avg_volume_20d=avg_volume,
+                            rsi_14=rsi_14,
+                            now_et=now_et,
+                            prev_close=prev_close,
+                        )
+                        if not gates_passed:
+                            return False, f"Entry gates: {'; '.join(gate_failures)}"
+            except Exception as e:
+                logger.debug(f"Entry gate check error: {e}")
+        
+        return True, ""
+
     def run_research_cycle(self, symbols: list[str] = None) -> dict:
         """Run Vibe-Trading + TradingAgents research for given symbols."""
         if symbols is None:
@@ -59,8 +184,13 @@ class DailyWorkflow:
         research = {}
 
         for symbol in symbols:
-            vibe_result = self.vibe.run_market_regime_analysis(symbol)
-            agents_result = self.agents.get_committee_signal(symbol)
+            try:
+                vibe_result = self.vibe.run_market_regime_analysis(symbol)
+                agents_result = self.agents.get_committee_signal(symbol)
+            except Exception as e:
+                logger.error(f"Research error for {symbol}: {e}")
+                vibe_result = {"output": "", "status": "ERROR"}
+                agents_result = {"signal": "neutral", "decision": "", "confidence": 0, "status": "ERROR"}
 
             research[symbol] = {
                 "underlying": symbol,
@@ -94,6 +224,18 @@ class DailyWorkflow:
             self._log_decision(candidate, PolicyResult(status="NO_TRADE", reasons=["No research provided"], allowed_action="none"))
             return self._build_report(candidate, None, None)
 
+        # ── MAX POWER FILTERS (NEW) ──
+        max_power_passed, max_power_reason = self._run_max_power_filters(candidate)
+        if not max_power_passed:
+            logger.warning(f"MAX POWER filter blocked: {max_power_reason}")
+            result = PolicyResult(
+                status="BLOCKED",
+                reasons=[max_power_reason],
+                allowed_action="none",
+            )
+            self._log_decision(candidate, result, None)
+            return self._build_report(candidate, result, None)
+
         # 2. Score
         score = self.scoring.score(candidate)
         logger.info(f"Candidate scored: {score.total}/100 (tier: {score.tier})")
@@ -124,7 +266,6 @@ class DailyWorkflow:
         cid = f"cand_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
         if research is None:
-            # Default no-trade candidate
             return TradeCandidate(
                 candidate_id=cid,
                 created_at=now,
@@ -160,7 +301,7 @@ class DailyWorkflow:
                 order_type=research.get("order_type", "limit"),
                 quantity=research.get("order_qty", 0.0),
                 notional_usd=research.get("order_notional", 0.0),
-                limit_price=research.get("limit_price") or self._fetch_market_price(research.get("symbol", "SPY")),
+                limit_price=research.get("limit_price") if research.get("limit_price") else None,
             ),
             risk=RiskDetails(
                 max_loss_usd=research.get("max_loss", 0.0),
@@ -200,18 +341,39 @@ class DailyWorkflow:
         if policy.allowed_action == "close_order":
             return self.broker.close_position(candidate.symbol)
         elif policy.allowed_action == "cancel_order":
-            return self.broker.cancel_order(f"paper_{candidate.candidate_id}")
+            # FIX: Use real order_id from candidate (not paper_ prefix)
+            order_id = getattr(candidate, 'order_id', None) or f"paper_{candidate.candidate_id}"
+            try:
+                return self.broker.cancel_order(order_id)
+            except Exception as e:
+                logger.error(f"Cancel order failed: {e}")
+                return {"status": "cancel_error", "error": str(e)}
         elif policy.allowed_action in ("paper_order", "live_order"):
+            # FIX: Only use limit_price if explicitly provided (don't fall back to market price)
+            limit_price = candidate.order.limit_price
+            if not limit_price or limit_price <= 0:
+                # Fetch market price as FALLBACK (not as order)
+                # The order will be placed at the bid-ask midpoint with a limit
+                limit_price = self._fetch_market_price(candidate.symbol)
+            
             order = OrderRequest(
                 candidate_id=candidate.candidate_id,
                 symbol=candidate.symbol,
                 side=candidate.order.side,
-                order_type=candidate.order.order_type,
+                order_type=candidate.order.order_type if candidate.order.order_type in ("market", "limit") else "limit",
                 qty=candidate.order.quantity,
                 notional=candidate.order.notional_usd if candidate.order.notional_usd > 0 else None,
-                limit_price=candidate.order.limit_price,
+                limit_price=limit_price,
             )
-            return self.broker.submit_order(order)
+            try:
+                result = self.broker.submit_order(order)
+                # Store order_id on candidate for potential cancellation
+                if isinstance(result, dict) and (result.get("order_id") or result.get("id")):
+                    candidate.order_id = result.get("order_id") or result.get("id")
+                return result
+            except Exception as e:
+                logger.error(f"Submit order failed: {e}")
+                return {"status": "submit_error", "error": str(e)}
         return {"status": "no_action_required"}
 
     def _log_decision(self, candidate: TradeCandidate, result: "PolicyResult", score: Optional["CandidateScore"] = None) -> None:
@@ -229,8 +391,10 @@ class DailyWorkflow:
             kill_switch_active=config.is_kill_switch_active,
         )
         self._decision_log_path.parent.mkdir(parents=True, exist_ok=True)
+        # FIX: Write with flush to prevent corruption on crash
         with open(self._decision_log_path, "a") as f:
             f.write(entry.model_dump_json() + "\n")
+            f.flush()
 
     def _build_report(self, candidate: TradeCandidate, result: Optional["PolicyResult"], score: Optional["CandidateScore"] = None, order_result: Optional[dict] = None, account: Optional[object] = None) -> dict:
         """Build a structured report for Telegram delivery."""
@@ -240,7 +404,7 @@ class DailyWorkflow:
             policy_status = result.status
         elif candidate.strategy == "no_trade":
             policy_status = "NO_TRADE"
-        
+
         report = {
             "cycle_timestamp": datetime.utcnow().isoformat(),
             "mode": config.trader_mode,

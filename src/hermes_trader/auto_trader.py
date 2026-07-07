@@ -105,7 +105,9 @@ def scan_and_score(symbols: list[str] = None) -> list[dict]:
     import numpy as np
 
     if symbols is None:
-        symbols = ["SPY", "QQQ", "SPXW", "NDXW"]
+        # FIX: Only SPY/QQQ have reliable 0DTE chains via Robinhood MCP.
+        # SPXW/NDXW often return empty chains, inflating the candidate count.
+        symbols = ["SPY", "QQQ"]
 
     # ── Phase 1: 0DTE Option Scanning via Robinhood MCP ──
     candidates_0dte = scan_0dte(symbols=symbols, min_score=20, max_candidates=20)
@@ -714,7 +716,8 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
     # ═══════════════════════════════════════════════════════════════
     underlying_sym = best.get("symbol", "SPY").split("/")[0] if "/" in best.get("symbol", "") else best.get("symbol", "SPY")
     # Strip W suffix for index symbols used in research
-    research_sym = underlying_sym.rstrip("W")
+    # FIX: Only strip ONE trailing W (SPXW → SPX), not all of them
+    research_sym = underlying_sym[:-1] if underlying_sym.endswith("W") else underlying_sym
 
     vibe_signal = _run_vibe_research(research_sym)
     agents_signal = _run_tradingagents_research(research_sym)
@@ -728,13 +731,15 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
     agents_signal_type = agents_signal.get("signal", "unknown")
 
     # Only "bullish" is allowed — everything else blocks
-    vibe_is_bullish = vibe_signal_type == "bullish"
-    agents_is_bullish = agents_signal_type == "bullish"
+    # FIX: Allow bearish signals (for puts). Only block if BOTH are neutral/error.
+    # Bearish research supports put trades.
+    vibe_is_actionable = vibe_signal_type in ("bullish", "bearish")
+    agents_is_actionable = agents_signal_type in ("bullish", "bearish")
 
-    # If either source failed or returned bearish/unknown/neutral → BLOCK
-    if not vibe_is_bullish or not agents_is_bullish:
+    # Both must be actionable (bullish or bearish). Neutral/error blocks.
+    if not vibe_is_actionable or not agents_is_actionable:
         result["action"] = "blocked"
-        result["reason"] = f"Research gate BLOCKED — Vibe: {vibe_signal_type}, Agents: {agents_signal_type}. Both must be BULLISH."
+        result["reason"] = f"Research gate BLOCKED — Vibe: {vibe_signal_type}, Agents: {agents_signal_type}. Both must be BULLISH or BEARISH."
         return result
 
     # ─── Calculate option quantity ───

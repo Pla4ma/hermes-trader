@@ -15,12 +15,12 @@ def check_earnings(symbol: str, days_ahead: int = 7) -> dict:
         ticker = yf.Ticker(symbol)
         cal = ticker.calendar
         if cal is None or cal.empty:
-            return {"has_earnings": False, "symbol": symbol}
+            return {"has_earnings": False, "symbol": symbol, "in_danger_zone": False, "days_until": -1}
 
         # Get next earnings date
         next_earnings = cal.index[0] if len(cal) > 0 else None
         if next_earnings is None:
-            return {"has_earnings": False, "symbol": symbol}
+            return {"has_earnings": False, "symbol": symbol, "in_danger_zone": False, "days_until": -1}
 
         today = datetime.utcnow().date()
         earnings_date = next_earnings.date() if hasattr(next_earnings, 'date') else next_earnings
