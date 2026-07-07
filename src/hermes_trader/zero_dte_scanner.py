@@ -76,17 +76,30 @@ def _safe_int(d: dict, *keys: str, default: int = 0) -> int:
 
 # ── MCP Integration ───────────────────────────────────────────
 
+def _unwrap_mcp_response(data: Any) -> Any:
+    """Unwrap Robinhood MCP's {'data': ..., 'guide': '...'} envelope.
+
+    All Robinhood MCP tool responses are wrapped in
+    {"data": <actual_result>, "guide": "<help_text>"}.
+    This helper extracts the inner 'data' payload.
+    """
+    if isinstance(data, dict) and "data" in data and "guide" in data:
+        return data["data"]
+    return data
+
+
 def _mcp_call(tool_name: str, arguments: Optional[dict] = None) -> Any:
     """Make a JSON-RPC call to Robinhood MCP.
 
     Uses robinhood_mcp_call from the broker adapter if available,
     falls back to direct HTTP call otherwise.
+    Automatically unwraps the MCP {'data': ..., 'guide': '...'} envelope.
     """
     try:
         from .integrations.robinhood_broker import robinhood_mcp_call
-        return robinhood_mcp_call(tool_name, arguments)
+        return _unwrap_mcp_response(robinhood_mcp_call(tool_name, arguments))
     except ImportError:
-        return _mcp_call_direct(tool_name, arguments)
+        return _unwrap_mcp_response(_mcp_call_direct(tool_name, arguments))
 
 
 def _mcp_call_direct(tool_name: str, arguments: Optional[dict] = None) -> Any:

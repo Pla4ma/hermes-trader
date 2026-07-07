@@ -32,6 +32,11 @@ from .vol_regime import fetch_vol_regime, should_trade_today as vol_should_trade
 from .correlation_regime import compute_correlation_regime, CorrelationRegime
 from .microstructure_signals import compute_microstructure, get_aggregate_pressure
 
+# ── Institutional-grade enrichment (options flow, dealer positioning, multi-timeframe) ──
+from .options_flow import OptionsFlowDetector, get_flow_sentiment
+from .dealer_positioning import quick_dealer_check, DealerPositioning
+from .multi_timeframe import combine_all as mtf_combine_all
+
 # ── Simple yfinance cache (60s TTL) ──
 _yf_cache = {}
 _yf_cache_ttl = 60  # seconds
@@ -144,9 +149,184 @@ def scan_and_score(symbols: list[str] = None) -> list[dict]:
             except Exception:
                 pass
 
-    # Sort by score
+    # ── Phase 3: Options Flow Sentiment (institutional-grade) ──
+    _enrich_with_flow_sentiment(candidates_0dte)
+
+    # ── Phase 4: Dealer Positioning (gamma exposure, walls, squeeze) ──
+    _enrich_with_dealer_positioning(candidates_0dte)
+
+    # ── Phase 5: Multi-Timeframe Confirmation ──
+    _enrich_with_multi_timeframe(candidates_0dte)
+
+    # Sort by enriched score
     candidates_0dte.sort(key=lambda x: x.get("score", 0), reverse=True)
     return candidates_0dte
+
+
+def _enrich_with_flow_sentiment(candidates: list[dict]) -> None:
+    """Enrich each candidate with options flow sentiment.
+
+    Uses OptionsFlowDetector to get net flow direction and adds a
+    flow_score bonus/penalty to the candidate's total score.
+    """
+    if not candidates:
+        return
+
+    # Get unique underlying symbols from candidates
+    symbols = list({c.get("symbol", "SPY").split("/")[0] for c in candidates})
+
+    for sym in symbols:
+        try:
+            flow = get_flow_sentiment(sym)
+            flow_score = flow.score  # -1.0 to +1.0
+            flow_signal = flow.signal  # "bullish", "bearish", "neutral"
+            flow_strength = flow.strength  # "strong", "moderate", "weak"
+
+            logger.info(
+                "Flow sentiment %s: %s (%s) score=%.3f",
+                sym, flow_signal, flow_strength, flow_score,
+            )
+
+            # Apply flow bonus/penalty to matching candidates
+            for c in candidates:
+                c_sym = c.get("symbol", "SPY").split("/")[0]
+                if c_sym != sym:
+                    continue
+
+                opt_type = c.get("type", "call")
+
+                # Bullish flow + call = bonus, bullish flow + put = penalty
+                # Bearish flow + put = bonus, bearish flow + call = penalty
+                if flow_signal == "bullish" and opt_type == "call":
+                    bonus = int(flow_score * 15)  # up to +15 points
+                elif flow_signal == "bearish" and opt_type == "put":
+                    bonus = int(abs(flow_score) * 15)
+                elif flow_signal == "bullish" and opt_type == "put":
+                    bonus = int(flow_score * -10)  # penalty: bullish flow against put
+                elif flow_signal == "bearish" and opt_type == "call":
+                    bonus = int(abs(flow_score) * -10)
+                else:
+                    bonus = 0
+
+                c["score"] = c.get("score", 0) + bonus
+                c["flow_sentiment"] = flow_signal
+                c["flow_score"] = round(flow_score, 3)
+                c["flow_strength"] = flow_strength
+                c["flow_bonus"] = bonus
+        except Exception as e:
+            logger.debug("Flow sentiment error for %s: %s", sym, e)
+
+
+def _enrich_with_dealer_positioning(candidates: list[dict]) -> None:
+    """Enrich each candidate with dealer positioning signals.
+
+    Uses quick_dealer_check to get GEX regime, gamma flip, squeeze risk,
+    and expected move — then adjusts scores accordingly.
+    """
+    if not candidates:
+        return
+
+    symbols = list({c.get("symbol", "SPY").split("/")[0] for c in candidates})
+
+    for sym in symbols:
+        try:
+            dealer = quick_dealer_check(sym)
+            regime = dealer.get("regime", "unknown")
+            squeeze_detected = dealer.get("squeeze_detected", False)
+            squeeze_risk = dealer.get("squeeze_risk", "low")
+
+            logger.info(
+                "Dealer positioning %s: regime=%s squeeze=%s risk=%s",
+                sym, regime, squeeze_detected, squeeze_risk,
+            )
+
+            for c in candidates:
+                c_sym = c.get("symbol", "SPY").split("/")[0]
+                if c_sym != sym:
+                    continue
+
+                opt_type = c.get("type", "call")
+
+                # Positive gamma = rangebound → selling options preferred
+                # Negative gamma = trending → buying options preferred
+                if regime == "positive_gamma":
+                    if opt_type == "call":
+                        c["score"] = c.get("score", 0) + 3  # mild bullish bonus in positive GEX
+                    else:
+                        c["score"] = c.get("score", 0) + 2  # puts also work in rangebound
+                elif regime == "negative_gamma":
+                    # Negative gamma = trending → directional bets get a bonus
+                    c["score"] = c.get("score", 0) + 5
+
+                # Squeeze risk penalty — high squeeze risk = dangerous for directional bets
+                if squeeze_detected and squeeze_risk in ("extreme", "high"):
+                    c["score"] = c.get("score", 0) - 10  # heavy penalty
+                    logger.warning("Squeeze risk %s for %s — penalizing", squeeze_risk, sym)
+
+                c["dealer_regime"] = regime
+                c["dealer_squeeze"] = squeeze_detected
+                c["dealer_squeeze_risk"] = squeeze_risk
+        except Exception as e:
+            logger.debug("Dealer positioning error for %s: %s", sym, e)
+
+
+def _enrich_with_multi_timeframe(candidates: list[dict]) -> None:
+    """Enrich each candidate with multi-timeframe alignment.
+
+    Uses combine_all() to check if 1d/30m/5m/1m agree on direction.
+    Strong alignment = score bonus, weak alignment = penalty.
+    """
+    if not candidates:
+        return
+
+    symbols = list({c.get("symbol", "SPY").split("/")[0] for c in candidates})
+
+    for sym in symbols:
+        try:
+            mtf = mtf_combine_all(sym)
+            alignment = mtf.get("alignment", {})
+            alignment_score = alignment.get("alignment_score", 0)
+            alignment_label = alignment.get("alignment_label", "NONE")
+            trade_direction = mtf.get("trade_direction", "none")
+            go_trade = mtf.get("go_trade", False)
+
+            logger.info(
+                "Multi-TF %s: alignment=%s (%.0f/100) direction=%s go=%s",
+                sym, alignment_label, alignment_score, trade_direction, go_trade,
+            )
+
+            for c in candidates:
+                c_sym = c.get("symbol", "SPY").split("/")[0]
+                if c_sym != sym:
+                    continue
+
+                opt_type = c.get("type", "call")
+                candidate_direction = "bullish" if opt_type == "call" else "bearish"
+
+                # Bonus/penalty based on alignment quality
+                if alignment_score >= 80 and trade_direction == candidate_direction:
+                    # Strong alignment in same direction = big bonus
+                    c["score"] = c.get("score", 0) + 15
+                elif alignment_score >= 60 and trade_direction == candidate_direction:
+                    # Moderate alignment = moderate bonus
+                    c["score"] = c.get("score", 0) + 8
+                elif alignment_score >= 40:
+                    # Weak alignment = small bonus
+                    c["score"] = c.get("score", 0) + 3
+                elif alignment_score < 40:
+                    # No alignment = penalty
+                    c["score"] = c.get("score", 0) - 5
+
+                # If multi-TF says no trade at all, heavy penalty
+                if not go_trade:
+                    c["score"] = c.get("score", 0) - 8
+
+                c["mtf_alignment"] = alignment_label
+                c["mtf_score"] = alignment_score
+                c["mtf_direction"] = trade_direction
+                c["mtf_go_trade"] = go_trade
+        except Exception as e:
+            logger.debug("Multi-TF error for %s: %s", sym, e)
 
 
 def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:

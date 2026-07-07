@@ -23,12 +23,11 @@ class TradingAgentsClient:
 
     def __init__(self, agents_path: str = "/opt/vendor/TradingAgents"):
         self.agents_path = Path(agents_path)
-        # Ensure CMDDD env vars are set for subprocess/sys.path import
-        import os
-        if "OPENAI_API_KEY" not in os.environ:
-            os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY", "")
-        if "OPENAI_BASE_URL" not in os.environ:
-            os.environ["OPENAI_BASE_URL"] = os.getenv("OPENAI_BASE_URL", "https://api.commandcode.ai/provider/v1")
+        # Load .env to get correct OPENAI_API_KEY / OPENAI_BASE_URL values.
+        # The .env file has OPENAI_BASE_URL=http://localhost:8787/v1 (headroom proxy)
+        # which must be used instead of the old CMDDD fallback.
+        from dotenv import load_dotenv
+        load_dotenv("/opt/hermes-trader/.env")
 
     @property
     def available(self) -> bool:

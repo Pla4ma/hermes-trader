@@ -43,6 +43,11 @@ from .correlation_regime import compute_correlation_regime
 from .news_catalyst import should_block_trade as news_should_block
 from .portfolio_risk import get_portfolio_risk_summary, check_drawdown
 
+# ── Institutional-grade enrichment modules ──
+from .options_flow import get_flow_sentiment
+from .dealer_positioning import quick_dealer_check
+from .multi_timeframe import combine_all as mtf_combine_all
+
 logger = logging.getLogger("hermes_trader.workflow")
 
 
@@ -227,42 +232,118 @@ class DailyWorkflow:
         
         return result
 
+    def _enrich_research(self, research_result: dict) -> dict:
+        """Enrich research with options flow, dealer positioning, and multi-TF signals.
+
+        This is Phase 2 of the pipeline: research -> ENRICHMENT -> candidate.
+        Each symbol in the research dict gets enriched with:
+        - Options flow sentiment (bullish/bearish/neutral from put/call flow)
+        - Dealer positioning (GEX regime, gamma flip, squeeze risk)
+        - Multi-timeframe confirmation (1d/30m/5m/1m alignment)
+
+        The enriched signals are stored in the research dict so they flow
+        into the candidate via _build_candidate() and influence scoring.
+        """
+        research = research_result.get("research", {})
+        if not research:
+            return research_result
+
+        for symbol, data in research.items():
+            # -- Options Flow Sentiment --
+            try:
+                flow = get_flow_sentiment(symbol)
+                data["flow_sentiment"] = flow.signal
+                data["flow_score"] = round(flow.score, 3)
+                data["flow_strength"] = flow.strength
+                logger.info(
+                    "Enrichment flow %s: %s (%s) score=%.3f",
+                    symbol, flow.signal, flow.strength, flow.score,
+                )
+            except Exception as e:
+                logger.debug("Flow enrichment error for %s: %s", symbol, e)
+                data["flow_sentiment"] = "neutral"
+                data["flow_score"] = 0.0
+                data["flow_strength"] = "weak"
+
+            # -- Dealer Positioning --
+            try:
+                dealer = quick_dealer_check(symbol)
+                data["dealer_regime"] = dealer.get("regime", "unknown")
+                data["dealer_squeeze_detected"] = dealer.get("squeeze_detected", False)
+                data["dealer_squeeze_risk"] = dealer.get("squeeze_risk", "low")
+                data["dealer_expected_move_pct"] = dealer.get("expected_move_pct", 0)
+                logger.info(
+                    "Enrichment dealer %s: regime=%s squeeze=%s",
+                    symbol, dealer.get("regime"), dealer.get("squeeze_risk"),
+                )
+            except Exception as e:
+                logger.debug("Dealer enrichment error for %s: %s", symbol, e)
+                data["dealer_regime"] = "unknown"
+                data["dealer_squeeze_detected"] = False
+                data["dealer_squeeze_risk"] = "low"
+
+            # -- Multi-Timeframe Confirmation --
+            try:
+                mtf = mtf_combine_all(symbol)
+                mtf_alignment = mtf.get("alignment", {})
+                data["mtf_alignment_score"] = mtf_alignment.get("alignment_score", 0)
+                data["mtf_alignment_label"] = mtf_alignment.get("alignment_label", "NONE")
+                data["mtf_trade_direction"] = mtf.get("trade_direction", "none")
+                data["mtf_go_trade"] = mtf.get("go_trade", False)
+                data["mtf_confidence"] = mtf.get("confidence", "NONE")
+                logger.info(
+                    "Enrichment multi-TF %s: alignment=%s (%.0f/100) go=%s",
+                    symbol,
+                    mtf_alignment.get("alignment_label"),
+                    mtf_alignment.get("alignment_score", 0),
+                    mtf.get("go_trade", False),
+                )
+            except Exception as e:
+                logger.debug("Multi-TF enrichment error for %s: %s", symbol, e)
+                data["mtf_alignment_score"] = 0
+                data["mtf_alignment_label"] = "NONE"
+                data["mtf_trade_direction"] = "none"
+                data["mtf_go_trade"] = False
+                data["mtf_confidence"] = "NONE"
+
+        return research_result
+
     def run(self, research_result: Optional[dict] = None) -> dict:
         """Run the full daily cycle.
+
+        PIPELINE: research -> enrichment -> candidate -> gates -> score -> execute
+        ONE ENGINE, ONE PIPELINE -- all signals flow through in sequence.
 
         Args:
             research_result: Optional pre-computed research. If None, a
                              workflow runs research first (Vibe-Trading +
                              TradingAgents) before building candidates.
-                             CRITICAL FIX: cron jobs always called wf.run()
-                             with no research, resulting in no_trade. Now
-                             they get real research.
         """
         mode = config.trader_mode
         logger.info(f"Daily workflow starting. Mode: {mode}")
         if config.is_kill_switch_active:
-            logger.warning("Kill switch ACTIVE — workflow returning NO_TRADE.")
+            logger.warning("Kill switch ACTIVE -- workflow returning NO_TRADE.")
             return {"status": "KILL_SWITCH_ACTIVE", "decision": "no_trade"}
-        # CRITICAL FIX (July 7, 2026):
-        # If no research provided, run research cycle first instead of
-        # building a no_trade candidate. The cron jobs call wf.run() with
-        # no research, so they were always returning no_trade. Now we
-        # run Vibe-Trading + TradingAgents first, then build candidates.
+
+        # -- Phase 1: Research (Vibe-Trading + TradingAgents) --
         if research_result is None:
-            logger.info("No research provided — running research cycle first.")
+            logger.info("No research provided -- running research cycle first.")
             research_result = self.run_research_cycle()
             if not research_result.get("research"):
                 logger.warning("Research cycle returned no data. Aborting.")
                 return {"status": "NO_RESEARCH", "decision": "no_trade"}
 
-        # 1. Generate candidate (from research or blank)
+        # -- Phase 2: Enrich research with flow/dealer/timeframe signals --
+        research_result = self._enrich_research(research_result)
+
+        # -- Phase 3: Build candidate from enriched research --
         candidate = self._build_candidate(research_result)
         if candidate.strategy == "no_trade":
             logger.info("No-trade candidate generated. Logging and exiting.")
             self._log_decision(candidate, PolicyResult(status="NO_TRADE", reasons=["No research provided"], allowed_action="none"))
             return self._build_report(candidate, None, None)
 
-        # ── MAX POWER FILTERS (NEW) ──
+        # -- Phase 4: MAX POWER Filters (vol regime, correlation, news, portfolio risk, entry gates) --
         max_power_passed, max_power_reason = self._run_max_power_filters(candidate)
         if not max_power_passed:
             logger.warning(f"MAX POWER filter blocked: {max_power_reason}")
@@ -274,28 +355,28 @@ class DailyWorkflow:
             self._log_decision(candidate, result, None)
             return self._build_report(candidate, result, None)
 
-        # 2. Score
+        # -- Phase 5: Score --
         score = self.scoring.score(candidate)
         logger.info(f"Candidate scored: {score.total}/100 (tier: {score.tier})")
 
-        # 3. Fetch account/market/risk state
+        # -- Phase 6: Fetch account/market/risk state --
         account = self.broker.get_account()
         market = self.broker.get_market_snapshot(candidate.underlying)
         risk_snapshot = self.broker.get_risk_snapshot()
 
-        # 4. Policy evaluation
+        # -- Phase 7: Policy evaluation --
         result = self.policy.evaluate(candidate, account, market, risk_snapshot, score)
         logger.info(f"Policy result: {result.status} | Action: {result.allowed_action}")
 
-        # 5. Execute if approved
+        # -- Phase 8: Execute if approved --
         order_result = None
         if result.is_approved or result.can_execute:
             order_result = self._execute(candidate, result)
 
-        # 6. Journal
+        # -- Phase 9: Journal --
         self._log_decision(candidate, result, score)
 
-        # 7. Report
+        # -- Phase 10: Report --
         return self._build_report(candidate, result, score, order_result, account)
 
     def _build_candidate(self, research: Optional[dict] = None) -> TradeCandidate:
