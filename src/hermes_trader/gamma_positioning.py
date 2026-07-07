@@ -147,7 +147,9 @@ class GammaPositioning:
             # GEX = Gamma × OI × Spot² × 0.01
             # Simplified: use gamma × spot² × 100
             oi = opt["open_interest"]
-            gex = gamma * spot * spot * oi * 0.01 * (1 if is_call else -1)
+            # Standard GEX formula: gamma × spot² × OI × 100 (contract multiplier)
+            # Matches dealer_positioning.py for consistency
+            gex = gamma * (spot ** 2) * oi * 100 * (1 if is_call else -1)
             total_gex += gex
 
             if strike not in gex_by_strike:

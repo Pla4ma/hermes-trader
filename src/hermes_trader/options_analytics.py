@@ -110,7 +110,9 @@ class OptionsAnalytics:
             strike = opt["strike"]
 
             oi = opt["open_interest"]
-            gex = gamma * spot * oi * (1 if is_call else -1)
+            # Standard GEX formula: gamma × spot² × OI × 100 × sign
+            # (matches dealer_positioning.py for consistency)
+            gex = gamma * (spot ** 2) * oi * 100 * (1 if is_call else -1)
             total_gex += gex
             gex_by_strike[strike] = gex_by_strike.get(strike, 0) + gex
 

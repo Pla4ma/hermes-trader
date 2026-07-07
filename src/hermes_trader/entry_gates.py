@@ -311,10 +311,14 @@ def gate_vwap_chop(spot: float, vwap: float, option_type: str) -> Tuple[bool, st
     vwap_distance_pct = ((spot - vwap) / vwap) * 100
     
     if option_type == "call":
+        # For calls: spot should be ABOVE VWAP (above average = bullish)
+        # Block if spot is within 0.1% of VWAP (chopping, no clear direction)
         if abs(vwap_distance_pct) < 0.1:
             return False, f"VWAP CHOP GATE: Calls blocked — SPY within 0.1% of VWAP (chopping, no direction)"
     elif option_type == "put":
-        if abs(vwap_distance_pct) < 0.1:
+        # For puts: spot should be BELOW VWAP (below average = bearish)
+        # Block if spot is WITHIN or ABOVE VWAP (no clear bearish direction)
+        if vwap_distance_pct > -0.1:  # spot is not clearly below VWAP
             return False, f"VWAP CHOP GATE: Puts blocked — SPY within 0.1% of VWAP (chopping, no direction)"
     
     return True, ""
