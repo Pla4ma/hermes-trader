@@ -327,11 +327,14 @@ class TestPaperBrokerAdapter:
 
 class TestDailyWorkflow:
     def test_run_without_research_returns_no_trade(self):
+        # CRITICAL FIX (July 7, 2026): wf.run(None) now runs research first
+        # (not no_trade). To test no_trade behavior, we mock the research cycle.
         wf = DailyWorkflow()
-        report = wf.run(research_result=None)
-        # Either returns policy_status=NO_TRADE or status=KILL_SWITCH_ACTIVE
-        ps = report.get("policy_status", report.get("status", ""))
-        assert ps in ("NO_TRADE", "KILL_SWITCH_ACTIVE", "REJECTED")
+        with patch.object(wf, 'run_research_cycle', return_value={"status": "COMPLETED", "research": {}}):
+            report = wf.run(research_result=None)
+            # Now returns NO_RESEARCH since the research dict is empty
+            ps = report.get("policy_status", report.get("status", ""))
+            assert ps in ("NO_RESEARCH", "NO_TRADE", "KILL_SWITCH_ACTIVE", "REJECTED")
 
     def test_run_with_mock_research(self):
         wf = DailyWorkflow()

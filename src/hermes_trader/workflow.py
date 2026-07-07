@@ -208,14 +208,28 @@ class DailyWorkflow:
 
         Args:
             research_result: Optional pre-computed research. If None, a
-                             simple no-trade candidate is used for testing.
+                             workflow runs research first (Vibe-Trading +
+                             TradingAgents) before building candidates.
+                             CRITICAL FIX: cron jobs always called wf.run()
+                             with no research, resulting in no_trade. Now
+                             they get real research.
         """
         mode = config.trader_mode
         logger.info(f"Daily workflow starting. Mode: {mode}")
-
         if config.is_kill_switch_active:
             logger.warning("Kill switch ACTIVE — workflow returning NO_TRADE.")
             return {"status": "KILL_SWITCH_ACTIVE", "decision": "no_trade"}
+        # CRITICAL FIX (July 7, 2026):
+        # If no research provided, run research cycle first instead of
+        # building a no_trade candidate. The cron jobs call wf.run() with
+        # no research, so they were always returning no_trade. Now we
+        # run Vibe-Trading + TradingAgents first, then build candidates.
+        if research_result is None:
+            logger.info("No research provided — running research cycle first.")
+            research_result = self.run_research_cycle()
+            if not research_result.get("research"):
+                logger.warning("Research cycle returned no data. Aborting.")
+                return {"status": "NO_RESEARCH", "decision": "no_trade"}
 
         # 1. Generate candidate (from research or blank)
         candidate = self._build_candidate(research_result)
