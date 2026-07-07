@@ -122,6 +122,9 @@ class DailyWorkflow:
             logger.debug(f"Portfolio risk check error: {e}")
 
         # 5. Entry gates (9 filters) — only for option candidates
+        # CRITICAL: default is BLOCK (False). Gates must explicitly pass.
+        # Old code defaulted to True inside try/except — any exception
+        # silently allowed trades through with zero safety checks.
         if candidate.asset_class == "option" and candidate.underlying in ("SPY", "QQQ", "SPXW", "NDXW"):
             try:
                 import yfinance as yf
@@ -155,26 +158,34 @@ class DailyWorkflow:
                     
                     option_type = "call" if candidate.direction == "bullish" else "put"
                     
-                    if spot > 0:
-                        gates_passed, gate_failures = check_all_gates(
-                            symbol=symbol,
-                            option_type=option_type,
-                            spot=spot,
-                            open_price=open_price,
-                            high_of_day=high_of_day,
-                            low_of_day=low_of_day,
-                            current_volume=current_volume,
-                            avg_volume_20d=avg_volume,
-                            rsi_14=rsi_14,
-                            now_et=now_et,
-                            prev_close=prev_close,
-                        )
-                        if not gates_passed:
-                            return False, f"Entry gates: {'; '.join(gate_failures)}"
+                    # MUST have valid spot price — block if missing
+                    if not spot or spot <= 0:
+                        return False, f"BLOCKED: spot price unavailable for {symbol}"
+                    
+                    gates_passed, gate_failures = check_all_gates(
+                        symbol=symbol,
+                        option_type=option_type,
+                        spot=spot,
+                        open_price=open_price,
+                        high_of_day=high_of_day,
+                        low_of_day=low_of_day,
+                        current_volume=current_volume,
+                        avg_volume_20d=avg_volume,
+                        rsi_14=rsi_14,
+                        now_et=now_et,
+                        prev_close=prev_close,
+                    )
+                    if not gates_passed:
+                        return False, f"Entry gates: {'; '.join(gate_failures)}"
+                    # Gates passed — trade allowed
+                    return True, ""
+                else:
+                    return False, f"BLOCKED: insufficient price data for {symbol}"
             except Exception as e:
-                logger.debug(f"Entry gate check error: {e}")
+                logger.error(f"Entry gate check FAILED (blocking trade): {e}")
+                return False, f"BLOCKED: gate check exception: {e}"
         
-        return True, ""
+        return False, f"BLOCKED: {candidate.asset_class} not eligible for auto-trade"
 
     def run_research_cycle(self, symbols: list[str] = None) -> dict:
         """Run Vibe-Trading + TradingAgents research for given symbols."""
@@ -243,7 +254,7 @@ class DailyWorkflow:
         if not max_power_passed:
             logger.warning(f"MAX POWER filter blocked: {max_power_reason}")
             result = PolicyResult(
-                status="BLOCKED",
+                status="REJECTED",
                 reasons=[max_power_reason],
                 allowed_action="none",
             )
