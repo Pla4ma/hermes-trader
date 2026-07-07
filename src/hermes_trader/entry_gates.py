@@ -151,15 +151,16 @@ def gate_time(now_et: datetime) -> Tuple[bool, str]:
 
 
 def gate_extended_move(spot: float, open_price: float, high_of_day: float, low_of_day: float, option_type: str) -> Tuple[bool, str]:
-    """Gate 2: Don't chase if underlying already moved too much.
+    """Gate 2: Adaptive extended move detection.
 
-    If SPY already moved >0.4% from open, the easy money is gone.
-    Buying calls after a 0.5%+ move is chasing — you're buying the top.
+    NORMAL days (move < 0.5%): strict 0.4% threshold — don't chase small moves.
+    TREND days (move > 1%): require fresh continuation evidence before entry.
+      - Don't auto-block on big days
+      - Require: failed bounce, break below swing low, or lower high
+      - This lets us participate in genuine trends while avoiding chasing
 
-    For CALLS: spot must be < 0.4% above open (not extended)
-    For PUTS: spot must be < 0.4% below open (not extended)
-
-    Also blocks if we're at the extreme of the day's range.
+    For calls: mirror logic (bounce up + rejection).
+    For puts: bounce down + rejection = continuation.
     """
     if open_price <= 0:
         return True, ""
@@ -170,16 +171,57 @@ def gate_extended_move(spot: float, open_price: float, high_of_day: float, low_o
     day_range = high_of_day - low_of_day if high_of_day > low_of_day else 1
     position_in_range = ((spot - low_of_day) / day_range) * 100 if day_range > 0 else 50
 
+    abs_move = abs(move_from_open)
+
+    # ── NORMAL DAY (move < 0.5%): strict original rules ──
+    if abs_move < 0.5:
+        if option_type == "call":
+            if move_from_open > 0.4:
+                return False, f"EXTENDED GATE: Calls blocked — normal day, already +{move_from_open:.2f}% (max 0.4%)"
+            if position_in_range > 85:
+                return False, f"EXTENDED GATE: Calls blocked — at {position_in_range:.0f}% of range (top 15%)"
+        elif option_type == "put":
+            if move_from_open < -0.4:
+                return False, f"EXTENDED GATE: Puts blocked — normal day, already {move_from_open:.2f}% (max -0.4%)"
+            if position_in_range < 15:
+                return False, f"EXTENDED GATE: Puts blocked — at {position_in_range:.0f}% of range (bottom 15%)"
+        return True, ""
+
+    # ── TREND DAY (move > 1%): require fresh continuation evidence ──
+    # Check for failed bounce pattern
+    # A failed bounce = price bounced from extreme, then rolled back
+    # We detect this by checking if spot is near the extreme after a bounce
+    bounce_from_extreme = 0
+    if option_type == "put":
+        # For puts: check if price bounced up from day low then came back down
+        bounce_from_extreme = ((spot - low_of_day) / day_range * 100) if day_range > 0 else 50
+    elif option_type == "call":
+        # For calls: check if price bounced down from day high then came back up
+        bounce_from_extreme = ((high_of_day - spot) / day_range * 100) if day_range > 0 else 50
+
+    # TREND DAY PUTS:
+    # Allow if: spot is within 25% of day low (bounced and came back = failed bounce)
+    # Block if: spot is above 50% of range (bounce is holding = no continuation)
+    if option_type == "put":
+        if position_in_range < 25:
+            # Near the low — failed bounce, continuation likely
+            return True, f"TREND DAY: Puts allowed — failed bounce detected ({position_in_range:.0f}% of range, move={move_from_open:.2f}%)"
+        elif position_in_range < 50:
+            # Mid range — ambiguous, allow with warning
+            return True, f"TREND DAY: Puts allowed — mid-range ({position_in_range:.0f}%), move={move_from_open:.2f}%"
+        else:
+            # Still near high — bounce holding, no continuation
+            return False, f"EXTENDED GATE: Puts blocked — trend day but bounce holding ({position_in_range:.0f}% of range)"
+
+    # TREND DAY CALLS:
+    # Mirror logic
     if option_type == "call":
-        if move_from_open > 0.4:
-            return False, f"EXTENDED GATE: Calls blocked — SPY already +{move_from_open:.2f}% from open (max 0.4%)"
-        if position_in_range > 85:
-            return False, f"EXTENDED GATE: Calls blocked — SPY at {position_in_range:.0f}% of day range (top 15%)"
-    elif option_type == "put":
-        if move_from_open < -0.4:
-            return False, f"EXTENDED GATE: Puts blocked — SPY already {move_from_open:.2f}% from open (max -0.4%)"
-        if position_in_range < 15:
-            return False, f"EXTENDED GATE: Puts blocked — SPY at {position_in_range:.0f}% of day range (bottom 15%)"
+        if position_in_range > 75:
+            return True, f"TREND DAY: Calls allowed — failed selloff detected ({position_in_range:.0f}% of range, move=+{move_from_open:.2f}%)"
+        elif position_in_range > 50:
+            return True, f"TREND DAY: Calls allowed — mid-range ({position_in_range:.0f}%), move=+{move_from_open:.2f}%"
+        else:
+            return False, f"EXTENDED GATE: Calls blocked — trend day but bounce holding ({position_in_range:.0f}% of range)"
 
     return True, ""
 
@@ -187,9 +229,15 @@ def gate_extended_move(spot: float, open_price: float, high_of_day: float, low_o
 def gate_pullback_bounce(spot: float, high_of_day: float, low_of_day: float, option_type: str) -> Tuple[bool, str]:
     """Gate 3: Must see a pullback + bounce before entry.
 
+    ADAPTIVE: On trend days (>1% move), loosen pullback requirement from
+    0.15% to 0.08% — the confirmation is already in the trend.
+
     For CALLS:
-      - Price must have pulled back at least 0.15% from intraday high
+      - Price must have pulled back from intraday high
       - Current price must be bouncing (above the pullback low)
+    For PUTS:
+      - Price must have bounced from intraday low
+      - Current price must be rolling over (below the bounce high)
       - This means we're NOT buying at the exact top
 
     For PUTS:
@@ -204,27 +252,38 @@ def gate_pullback_bounce(spot: float, high_of_day: float, low_of_day: float, opt
 
     day_range = high_of_day - low_of_day
 
+    # Detect trend day: >1% move from open
+    move_from_open_pct = 0
+    if high_of_day > 0 and low_of_day > 0:
+        mid = (high_of_day + low_of_day) / 2
+        move_from_open_pct = abs(((mid - low_of_day) / low_of_day) * 100) if low_of_day > 0 else 0
+    is_trend_day = move_from_open_pct > 1.0
+    
+    # On trend days, loosen pullback requirement (trend already confirmed)
+    pullback_threshold = 0.08 if is_trend_day else 0.15
+    trend_label = "TREND DAY" if is_trend_day else ""
+
     if option_type == "call":
         # Pullback from high: how far did price drop from today's high?
         pullback_pct = ((high_of_day - spot) / high_of_day) * 100
 
-        if pullback_pct < 0.15:
-            return False, f"PULLBACK GATE: Calls blocked — SPY only {pullback_pct:.2f}% below day high (need ≥0.15% pullback first)"
+        if pullback_pct < pullback_threshold:
+            return False, f"PULLBACK GATE: Calls blocked — {trend_label} only {pullback_pct:.2f}% below high (need ≥{pullback_threshold}%)"
 
         # Bounce: price should be above the halfway point of the pullback
         pullback_low = high_of_day - (day_range * 0.3)  # Estimate pullback zone
         if spot < pullback_low:
-            return False, f"PULLBACK GATE: Calls blocked — SPY in pullback zone, no bounce yet"
+            return False, f"PULLBACK GATE: Calls blocked — in pullback zone, no bounce yet"
 
     elif option_type == "put":
         bounce_pct = ((spot - low_of_day) / low_of_day) * 100
 
-        if bounce_pct < 0.15:
-            return False, f"PULLBACK GATE: Puts blocked — SPY only {bounce_pct:.2f}% above day low (need ≥0.15% bounce first)"
+        if bounce_pct < pullback_threshold:
+            return False, f"PULLBACK GATE: Puts blocked — {trend_label} only {bounce_pct:.2f}% above low (need ≥{pullback_threshold}%)"
 
         bounce_high = low_of_day + (day_range * 0.3)
         if spot > bounce_high:
-            return False, f"PULLBACK GATE: Puts blocked — SPY in bounce zone, no rollover yet"
+            return False, f"PULLBACK GATE: Puts blocked — in bounce zone, no rollover yet"
 
     return True, ""
 

@@ -130,7 +130,7 @@ class DailyWorkflow:
         # CRITICAL: default is BLOCK (False). Gates must explicitly pass.
         # Old code defaulted to True inside try/except — any exception
         # silently allowed trades through with zero safety checks.
-        if candidate.asset_class == "option" and candidate.underlying in ("SPY", "QQQ", "SPXW", "NDXW"):
+        if candidate.asset_class == "option":  # All underlyings eligible (fixed: was hardcoded to 4 symbols)
             try:
                 import yfinance as yf
                 from datetime import datetime as dt
@@ -379,8 +379,51 @@ class DailyWorkflow:
         # -- Phase 10: Report --
         return self._build_report(candidate, result, score, order_result, account)
 
+    def _pick_best_symbol(self, research_result: dict) -> Optional[dict]:
+        """Pick the best trading candidate from per-symbol research data.
+        
+        Scans all symbols in research_result["research"], selects the one
+        with highest confidence and actionable signal (bullish or bearish).
+        Returns the per-symbol dict or None if nothing actionable.
+        """
+        research = research_result.get("research", {})
+        if not research:
+            return None
+
+        best = None
+        best_score = -1
+
+        for symbol, data in research.items():
+            signal = data.get("signal", "neutral")
+            confidence = data.get("confidence_score", 0)
+            mtf_go = data.get("mtf_go_trade", False)
+            flow = data.get("flow_sentiment", "neutral")
+
+            # Skip neutral signals — nothing actionable
+            if signal == "neutral":
+                continue
+
+            # Score: confidence * alignment bonus
+            score = confidence
+            if mtf_go:
+                score *= 1.3  # multi-TF alignment bonus
+            if flow == signal:
+                score *= 1.2  # flow confirms direction
+
+            if score > best_score:
+                best_score = score
+                best = data
+
+        return best
+
     def _build_candidate(self, research: Optional[dict] = None) -> TradeCandidate:
-        """Build a TradeCandidate from research data or default no-trade."""
+        """Build a TradeCandidate from research data or default no-trade.
+        
+        FIXED (2026-07-07): Research is a dict with structure:
+        {"status": "COMPLETED", "research": {"SPY": {...}, "QQQ": {...}, ...}}
+        Must pick the best symbol from the per-symbol research data,
+        not read from the top-level dict (which has no strategy/asset_class).
+        """
         now = datetime.utcnow().isoformat()
         cid = f"cand_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
@@ -404,54 +447,105 @@ class DailyWorkflow:
                 option_details=OptionDetails(),
             )
 
-        # Extract structured fields from research dict
+        # Pick best symbol from per-symbol research data
+        best = self._pick_best_symbol(research)
+        if best is None:
+            logger.info("No actionable signal in research — generating no_trade candidate.")
+            return TradeCandidate(
+                candidate_id=cid,
+                created_at=now,
+                mode=config.trader_mode,
+                underlying="SPY",
+                symbol="SPY",
+                asset_class="equity",
+                strategy="no_trade",
+                direction="neutral",
+                action="no_trade",
+                confidence=ConfidenceInfo(score_0_to_100=0, label="low", reason="All signals neutral"),
+                source=SourceInfo(),
+                evidence=EvidencePack(),
+                exit_plan=ExitPlan(),
+                order=OrderDetails(),
+                risk=RiskDetails(),
+                option_details=OptionDetails(),
+            )
+
+        # Build candidate from best symbol's data
+        signal = best.get("signal", "neutral")
+        direction = "bullish" if signal == "bullish" else "bearish"
+        option_type = "call" if direction == "bullish" else "put"
+        strategy = "long_call" if direction == "bullish" else "long_put"
+
+        logger.info(
+            "Best candidate: %s signal=%s conf=%.2f strategy=%s",
+            best.get("symbol", "?"), signal, best.get("confidence_score", 0), strategy,
+        )
+
+        # Fetch spot price for ATM strike (required by pydantic validator)
+        spot = 0.0
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker(best.get("symbol", "SPY"))
+            fast = ticker.fast_info
+            spot = float(fast.get("lastPrice", 0) or 0)
+        except Exception as e:
+            logger.debug(f"Spot price fetch failed: {e}")
+        if spot <= 0:
+            spot = 580.0  # fallback — will be corrected by entry gates
+
         return TradeCandidate(
             candidate_id=cid,
             created_at=now,
             mode=config.trader_mode,
-            underlying=research.get("underlying", "SPY"),
-            symbol=research.get("symbol", "SPY"),
-            asset_class=research.get("asset_class", "equity"),
-            strategy=research.get("strategy", "no_trade"),
-            direction=research.get("direction", "neutral"),
-            action=research.get("action", "no_trade"),
+            underlying=best.get("underlying", "SPY"),
+            symbol=best.get("symbol", "SPY"),
+            asset_class="option",
+            strategy=strategy,
+            direction=direction,
+            action="open",
             order=OrderDetails(
-                side=research.get("order_side", "buy"),
-                order_type=research.get("order_type", "limit"),
-                quantity=research.get("order_qty", 0.0),
-                notional_usd=research.get("order_notional", 0.0),
-                limit_price=research.get("limit_price") if research.get("limit_price") else None,
+                side="buy",
+                order_type="limit",
+                quantity=1,
+                notional_usd=0.0,
+                limit_price=None,
             ),
             risk=RiskDetails(
-                max_loss_usd=research.get("max_loss", 0.0),
-                expected_loss_usd=research.get("expected_loss", 0.0),
-                max_profit_usd=research.get("max_profit", 0.0),
-                risk_reward_ratio=research.get("risk_reward", 0.0),
-                position_notional_usd=research.get("notional", 0.0),
+                max_loss_usd=0.0,
+                expected_loss_usd=0.0,
+                max_profit_usd=0.0,
+                risk_reward_ratio=0.0,
+                position_notional_usd=0.0,
             ),
             evidence=EvidencePack(
-                market_data_timestamp=research.get("data_timestamp", now),
-                vibe_summary=research.get("vibe_summary", ""),
-                tradingagents_summary=research.get("agents_summary", ""),
-                bull_case=research.get("bull_case", ""),
-                bear_case=research.get("bear_case", ""),
-                risk_case=research.get("risk_case", ""),
-                backtest_summary=research.get("backtest_summary"),
-                transaction_cost_assumption=research.get("tx_cost"),
-                slippage_assumption=research.get("slippage"),
-                known_limitations=research.get("limitations", []),
+                market_data_timestamp=now,
+                vibe_summary=best.get("vibe_summary", ""),
+                tradingagents_summary=best.get("agents_summary", ""),
+                bull_case="",
+                bear_case="",
+                risk_case="",
+                backtest_summary=None,
+                transaction_cost_assumption=None,
+                slippage_assumption=None,
+                known_limitations=[],
             ),
             exit_plan=ExitPlan(
-                profit_take_rule=research.get("exit_profit_take", ""),
-                stop_loss_rule=research.get("exit_stop_loss", ""),
-                time_exit_rule=research.get("exit_time", ""),
-                expiration_exit_rule=research.get("exit_expiration", ""),
-                emergency_exit_rule=research.get("exit_emergency", ""),
+                profit_take_rule="50% at +50%, all at +100%",
+                stop_loss_rule="-30% hard stop",
+                time_exit_rule="30 min before close",
+                expiration_exit_rule="Force close 0DTE by 3:45 PM",
+                emergency_exit_rule="Kill switch",
             ),
             confidence=ConfidenceInfo(
-                score_0_to_100=research.get("confidence_score", 50),
-                label=research.get("confidence_label", "medium"),
-                reason=research.get("confidence_reason", ""),
+                score_0_to_100=int(best.get("confidence_score", 0.5) * 100),
+                label="high" if best.get("confidence_score", 0) > 0.7 else "medium" if best.get("confidence_score", 0) > 0.5 else "low",
+                reason=f"Signal: {signal}, MTF: {best.get('mtf_alignment_label', 'NONE')}, Flow: {best.get('flow_sentiment', 'neutral')}",
+            ),
+            option_details=OptionDetails(
+                option_type=option_type,
+                days_to_expiration=0,
+                strike=round(spot, 2),
+                expiration_date="2026-07-07",
             ),
         )
 

@@ -519,3 +519,21 @@ async def run_watcher():
     
     # Run until market close
     await watcher.start()
+
+if __name__ == "__main__":
+    import asyncio
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
+        stream=__import__('sys').stdout
+    )
+    print(f"[trigger_engine] Starting watcher at {datetime.now(ET).strftime('%H:%M:%S %Z')}", flush=True)
+    try:
+        asyncio.run(run_watcher())
+    except KeyboardInterrupt:
+        print("[trigger_engine] Stopped by user", flush=True)
+    except Exception as e:
+        print(f"[trigger_engine] Fatal error: {e}", flush=True)
+        import traceback
+        traceback.print_exc()

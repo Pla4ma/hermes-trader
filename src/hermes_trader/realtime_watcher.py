@@ -43,7 +43,7 @@ logger = logging.getLogger("hermes_trader.realtime_watcher")
 ET = ZoneInfo("America/New_York")
 
 # ── Configuration ──
-EQUITY_POLL_INTERVAL = 1.0        # seconds — how often to check SPY/QQQ
+EQUITY_POLL_INTERVAL = 5.0        # seconds — increased from 1s to avoid rate limits
 OPTION_POLL_INTERVAL = 2.0        # seconds — how often to check option quotes
 PRICE_CHANGE_THRESHOLD = 0.05     # % change to trigger event
 MOMENTUM_WINDOW = 5               # seconds — lookback for momentum calculation
@@ -93,7 +93,11 @@ class PriceWatcher:
     
     def __init__(self, account_number: str = "924058324", watch_symbols: List[str] = None):
         self.account_number = account_number
-        self.watch_symbols = watch_symbols or ["SPY", "QQQ"]
+        try:
+            from .config import config as _cfg
+            self.watch_symbols = watch_symbols or list(_cfg.allowed_underlyings)[:10]  # cap at 10 for rate limits
+        except Exception:
+            self.watch_symbols = watch_symbols or ["SPY", "QQQ"]
         
         # Price state
         self.last_prices: Dict[str, float] = {}
@@ -111,6 +115,8 @@ class PriceWatcher:
         self.running = False
         self.tasks: Set[asyncio.Task] = set()
         self._stop_event = asyncio.Event()
+        self._rate_limit_cooldown = 0  # seconds to wait after rate limit
+        self._consecutive_failures = 0
     
     def add_trigger(self, callback: Callable[[PriceEvent], None]):
         """Register a callback to fire on price events.
@@ -147,21 +153,35 @@ class PriceWatcher:
         return self.events_this_minute >= MAX_EVENTS_PER_MINUTE
     
     async def _get_equity_quote(self, symbol: str) -> Optional[dict]:
-        """Fetch equity quote via Robinhood MCP."""
+        """Fetch equity quote via Robinhood MCP with rate limit backoff."""
+        # If in cooldown, skip the call entirely
+        if self._rate_limit_cooldown > 0:
+            return None
         try:
             from .integrations.robinhood_broker import robinhood_mcp_call
-            result = robinhood_mcp_call("get_equity_quotes", {"symbols": [symbol]})
+            result = robinhood_mcp_call("get_equity_quotes", {"symbols": [symbol]}, retries=1)
             if result and "results" in result:
                 q = result["results"][0] if result["results"] else {}
                 if q and "last_trade_price" in q:
+                    self._consecutive_failures = 0  # reset on success
                     return {
                         "price": float(q["last_trade_price"]),
                         "bid": float(q.get("bid_price", 0) or 0),
                         "ask": float(q.get("ask_price", 0) or 0),
                         "timestamp": datetime.now(ET),
                     }
+            # Check for rate limit in response
+            if result and "RATE_LIMITED" in str(result):
+                self._consecutive_failures += 1
+                self._rate_limit_cooldown = min(120, max(30, 2 ** self._consecutive_failures))
+                logger.warning(f"Rate limited, backing off {self._rate_limit_cooldown}s (fail #{self._consecutive_failures})")
         except Exception as e:
-            logger.debug(f"Quote fetch error for {symbol}: {e}")
+            self._consecutive_failures += 1
+            if "rate" in str(e).lower() or "429" in str(e):
+                self._rate_limit_cooldown = min(120, max(30, 2 ** self._consecutive_failures))
+                logger.warning(f"Rate limited (exception), backing off {self._rate_limit_cooldown}s")
+            else:
+                logger.debug(f"Quote fetch error for {symbol}: {e}")
         return None
     
     async def _get_option_quote(self, option_id: str) -> Optional[dict]:
@@ -263,6 +283,61 @@ class PriceWatcher:
             except Exception as e:
                 logger.error(f"Trigger error: {e}")
     
+
+    async def _batch_poll_all(self):
+        """Batch-poll all watch symbols in ONE MCP call. Replaces per-symbol tasks."""
+        from .integrations.robinhood_broker import robinhood_mcp_call
+        while not self._stop_event.is_set():
+            try:
+                if self._rate_limit_cooldown > 0:
+                    logger.info(f"Rate limit cooldown: sleeping {self._rate_limit_cooldown}s")
+                    await asyncio.sleep(self._rate_limit_cooldown)
+                    self._rate_limit_cooldown = 0
+                    continue
+                
+                # ONE call for all symbols
+                result = robinhood_mcp_call("get_equity_quotes", {"symbols": self.watch_symbols}, retries=1)
+                
+                if result and "RATE_LIMITED" in str(result):
+                    self._consecutive_failures += 1
+                    self._rate_limit_cooldown = min(120, max(30, 2 ** self._consecutive_failures))
+                    logger.warning(f"Rate limited on batch poll, backing off {self._rate_limit_cooldown}s")
+                    continue
+                
+                if result and "results" in result:
+                    self._consecutive_failures = 0
+                    for q in result["results"] or []:
+                        sym = q.get("symbol", "")
+                        if sym and "last_trade_price" in q:
+                            price = float(q["last_trade_price"])
+                            quote = {
+                                "price": price,
+                                "bid": float(q.get("bid_price", 0) or 0),
+                                "ask": float(q.get("ask_price", 0) or 0),
+                                "timestamp": datetime.now(ET),
+                            }
+                            self._record_price(sym, price)
+                            self.last_quote[sym] = quote
+                            
+                            # Detect events
+                            event = self._detect_momentum(sym, price)
+                            event = event or self._detect_threshold_break(sym, price)
+                            if event is None:
+                                event = self._detect_spread_narrowing(sym, quote)
+                            if event:
+                                await self._fire_triggers(event)
+                            
+                            self.last_prices[sym] = price
+            except Exception as e:
+                if "rate" in str(e).lower() or "429" in str(e):
+                    self._consecutive_failures += 1
+                    self._rate_limit_cooldown = min(120, max(30, 2 ** self._consecutive_failures))
+                    logger.warning(f"Rate limited (exception), backing off {self._rate_limit_cooldown}s")
+                else:
+                    logger.debug(f"Batch poll error: {e}")
+            
+            await asyncio.sleep(EQUITY_POLL_INTERVAL)
+
     async def _monitor_equity(self, symbol: str):
         """Continuously monitor an equity symbol."""
         while not self._stop_event.is_set():
@@ -291,7 +366,13 @@ class PriceWatcher:
             except Exception as e:
                 logger.debug(f"Monitor error for {symbol}: {e}")
             
-            await asyncio.sleep(EQUITY_POLL_INTERVAL)
+            # Use longer sleep when rate limited
+            if self._rate_limit_cooldown > 0:
+                logger.info(f"Rate limit cooldown: sleeping {self._rate_limit_cooldown}s")
+                await asyncio.sleep(self._rate_limit_cooldown)
+                self._rate_limit_cooldown = 0  # reset after cooldown
+            else:
+                await asyncio.sleep(EQUITY_POLL_INTERVAL)
     
     async def _monitor_position(self, option_id: str, position_data: dict):
         """Continuously monitor an option position for exit triggers."""
@@ -393,11 +474,10 @@ class PriceWatcher:
                 # Windows / non-Unix
                 pass
         
-        # Start equity monitors
-        for symbol in self.watch_symbols:
-            task = asyncio.create_task(self._monitor_equity(symbol))
-            self.tasks.add(task)
-            task.add_done_callback(self.tasks.discard)
+        # Start batch equity monitor (ONE call for all symbols)
+        task = asyncio.create_task(self._batch_poll_all())
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
         
         # Wait for stop signal
         await self._stop_event.wait()
