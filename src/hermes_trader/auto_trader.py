@@ -31,6 +31,7 @@ from .portfolio_risk import (
 from .vol_regime import fetch_vol_regime, should_trade_today as vol_should_trade, get_size_multiplier as vol_size_mult
 from .correlation_regime import compute_correlation_regime, CorrelationRegime
 from .microstructure_signals import compute_microstructure, get_aggregate_pressure
+from .smart_exits import calculate_smart_exit
 
 # ── Institutional-grade enrichment (options flow, dealer positioning, multi-timeframe) ──
 from .options_flow import OptionsFlowDetector, get_flow_sentiment
@@ -1098,16 +1099,16 @@ def _load_optimal_params(symbol: str) -> dict:
 
 
 def manage_exits() -> dict:
-    """Check option positions and manage exits with trailing stops + profit-taking.
+    """Check option positions and manage exits with SMART + trailing stops.
 
-    All orders routed through Robinhood MCP broker adapter.
-    For 0DTE options:
-    - If loss > 50%, close immediately (stop-loss)
-    - If profit > 50%, tighten trail to 20%
-    - If profit > 100%, sell 50%
-    - If profit > 200%, sell remaining
+    Uses smart_exits.py for intelligent exit timing:
+    - Sells into strength, not weakness
+    - Uses VWAP, RSI, time decay for decisions
+    - Sells half at +50%, trails rest
+    - Hard close at 3:30 PM ET (0DTE theta crush)
+    - Momentum fade detection
     
-    CRITICAL: Uses place_option_order for closing options, NOT place_equity_order.
+    All orders routed through Robinhood MCP broker adapter.
     """
     broker = _get_broker()
     positions = broker.list_positions()
