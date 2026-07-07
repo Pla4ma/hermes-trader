@@ -193,99 +193,183 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
         return result
     
     # ═══════════════════════════════════════════════════════════════
-    # QUALITY SCORE CHECK — reject low-quality setups
+    # DUAL MODEL SCORING — Probability + Magnitude (friend's advice)
     # ═══════════════════════════════════════════════════════════════
-    # Minimum quality score: 8/12 to trade (professional-grade filtering)
-    MIN_QUALITY_SCORE = 8
+    # Two separate models:
+    # 1. Probability model: What's the chance this trade wins?
+    # 2. Magnitude model: If it wins, how large is the expected move?
     
-    def calculate_quality_score(candidate, analytics=None):
-        """Calculate quality score (0-12) based on professional-grade factors.
+    # Minimum thresholds
+    MIN_PROBABILITY = 0.55  # 55% win probability minimum
+    MIN_EV = 0.10           # 10% expected value minimum
+    
+    def calculate_probability(candidate, analytics=None):
+        """Calculate win probability (0.0-1.0) for this trade.
         
-        Factors from friend's advice:
-        - Dealer gamma regime
-        - Above/below VWAP
-        - Relative volume
-        - Delta acceleration
-        - VIX direction
-        - QQQ confirmation
-        - Time of day
-        - Distance from expected move
+        Factors affecting probability of winning:
+        - Delta (higher = more likely ITM)
+        - Volume (higher = easier execution)
+        - Spread (tighter = less slippage)
+        - IV (moderate = best risk/reward)
+        - Gamma (higher = faster moves)
+        - QQQ confirmation (cross-market)
+        - VIX favorable (low/declining)
+        - Dealer gamma regime (positive = trending)
+        - Time of day (optimal windows)
         """
-        score = 0
+        prob = 0.50  # Base 50% probability
         
-        # 1. Delta in sweet spot (0.35-0.50) +1
+        # Delta adjustment
         delta = abs(candidate.get("delta", 0))
         if 0.35 <= delta <= 0.50:
-            score += 1
+            prob += 0.10
         elif 0.25 <= delta <= 0.60:
-            score += 0.5
+            prob += 0.05
+        elif delta < 0.20:
+            prob -= 0.10
         
-        # 2. Volume above average +1
+        # Volume adjustment
         vol = candidate.get("volume", 0)
         if vol > 100000:
-            score += 1
+            prob += 0.08
         elif vol > 50000:
-            score += 0.5
+            prob += 0.04
+        elif vol < 10000:
+            prob -= 0.08
         
-        # 3. Spread tight (< 10% of mid) +1
+        # Spread adjustment
         bid = candidate.get("bid", 0)
         ask = candidate.get("ask", 0)
         mid = candidate.get("mid", 0)
         if mid > 0 and bid > 0 and ask > 0:
             spread_pct = ((ask - bid) / mid) * 100
             if spread_pct < 10:
-                score += 1
+                prob += 0.06
             elif spread_pct < 20:
-                score += 0.5
+                prob += 0.03
+            elif spread_pct > 30:
+                prob -= 0.06
         
-        # 4. IV in reasonable range +1
+        # IV adjustment
         iv = candidate.get("iv", 0)
         if 0.25 <= iv <= 0.45:
-            score += 1
+            prob += 0.05
         elif 0.15 <= iv <= 0.55:
-            score += 0.5
+            prob += 0.02
+        elif iv > 0.60:
+            prob -= 0.05
         
-        # 5. Gamma high (0DTE explosive) +1
+        # Gamma adjustment
         gamma = candidate.get("gamma", 0)
         if gamma > 0.10:
-            score += 1
+            prob += 0.06
         elif gamma > 0.05:
-            score += 0.5
+            prob += 0.03
         
-        # 6. QQQ confirmation (+1) — if QQQ same direction
+        # QQQ confirmation
         if analytics:
             qqq_signal = analytics.get("qqq_confirmation", False)
             if qqq_signal:
-                score += 1
+                prob += 0.05
+            else:
+                prob -= 0.05
         
-        # 7. VIX favorable (+1) — VIX declining or low
+        # VIX adjustment
         if analytics:
             vix_signal = analytics.get("vix_favorable", False)
             if vix_signal:
-                score += 1
+                prob += 0.04
+            else:
+                prob -= 0.04
         
-        # 8. Dealer gamma regime (+1) — positive gamma = trending
+        # Gamma regime adjustment
         if analytics:
             gamma_regime = analytics.get("gamma_regime", "unknown")
             if gamma_regime == "positive":
-                score += 1
+                prob += 0.05
             elif gamma_regime == "negative":
-                score += 0.5  # Still tradeable but riskier
+                prob += 0.02
         
-        # 9. Time of day bonus (+1) — morning/afternoon windows
+        # Time of day adjustment
         from zoneinfo import ZoneInfo
         from datetime import datetime as dt
         now_et = dt.now(ZoneInfo("America/New_York"))
         hour = now_et.hour
         minute = now_et.minute
         
-        # Morning window (9:45-10:30) or afternoon (2:00-3:30)
         if (hour == 9 and minute >= 45) or (hour == 10 and minute <= 30):
-            score += 1  # Morning momentum
+            prob += 0.05
         elif hour == 14 or (hour == 15 and minute <= 30):
-            score += 1  # Afternoon trend
+            prob += 0.05
+        elif hour == 12 or hour == 13:
+            prob -= 0.08
         
-        return score
+        return max(0.10, min(0.90, prob))
+    
+    def calculate_magnitude(candidate, analytics=None):
+        """Calculate expected move magnitude (0.0-1.0) if trade wins.
+        
+        Factors affecting how much the option could move:
+        - Gamma (higher = larger moves)
+        - IV (higher = larger expected moves)
+        - Volume (higher = more momentum)
+        - Expected move from analytics
+        - Distance from spot to strike
+        """
+        mag = 0.30  # Base 30% move expected
+        
+        # Gamma adjustment
+        gamma = candidate.get("gamma", 0)
+        if gamma > 0.15:
+            mag += 0.25
+        elif gamma > 0.10:
+            mag += 0.15
+        elif gamma > 0.05:
+            mag += 0.08
+        
+        # IV adjustment
+        iv = candidate.get("iv", 0)
+        if iv > 0.40:
+            mag += 0.15
+        elif iv > 0.30:
+            mag += 0.08
+        
+        # Volume adjustment
+        vol = candidate.get("volume", 0)
+        if vol > 200000:
+            mag += 0.10
+        elif vol > 100000:
+            mag += 0.05
+        
+        # Expected move from analytics
+        if analytics:
+            expected_move = analytics.get("expected_move", 0)
+            if expected_move > 1.0:
+                mag += 0.15
+            elif expected_move > 0.5:
+                mag += 0.08
+        
+        # Distance from spot
+        spot = candidate.get("underlying_price", 0)
+        strike = candidate.get("strike", 0)
+        if spot > 0 and strike > 0:
+            distance_pct = abs(strike - spot) / spot * 100
+            if distance_pct < 0.2:
+                mag += 0.10
+            elif distance_pct < 0.5:
+                mag += 0.05
+            elif distance_pct > 1.0:
+                mag -= 0.10
+        
+        return max(0.10, min(1.0, mag))
+    
+    def calculate_expected_value(probability, magnitude, cost_pct):
+        """Calculate expected value: EV = (P × Mag) - ((1-P) × Cost)
+        
+        If EV > 0, trade has positive expected value.
+        """
+        ev = (probability * magnitude) - ((1 - probability) * cost_pct)
+        return ev
     
     # Get market analytics for quality scoring
     market_analytics = {}
@@ -326,14 +410,25 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
     
     # Score all viable candidates
     for c in viable:
-        c["quality_score"] = calculate_quality_score(c, market_analytics)
+        c["probability"] = calculate_probability(c, market_analytics)
+        c["magnitude"] = calculate_magnitude(c, market_analytics)
+        # Calculate expected value
+        cost_pct = 0.50  # Assume 50% max loss (stop loss at -50%)
+        c["expected_value"] = calculate_expected_value(c["probability"], c["magnitude"], cost_pct)
     
-    # Filter by quality score
-    quality_viable = [c for c in viable if c.get("quality_score", 0) >= MIN_QUALITY_SCORE]
+    # Filter by probability AND expected value
+    quality_viable = [c for c in viable if c.get("probability", 0) >= MIN_PROBABILITY and c.get("expected_value", 0) >= MIN_EV]
     result["quality_candidates"] = len(quality_viable)
+    result["scoring"] = {
+        "min_probability": MIN_PROBABILITY,
+        "min_ev": MIN_EV,
+        "best_probability": viable[0].get("probability", 0) if viable else 0,
+        "best_magnitude": viable[0].get("magnitude", 0) if viable else 0,
+        "best_ev": viable[0].get("expected_value", 0) if viable else 0,
+    }
     
     if not quality_viable:
-        result["reason"] = f"No candidates with quality score ≥{MIN_QUALITY_SCORE}/10"
+        result["reason"] = f"No candidates with prob ≥{MIN_PROBABILITY} AND EV ≥{MIN_EV}"
         return result
     
     best = quality_viable[0]
@@ -597,7 +692,9 @@ def auto_trade(min_score: int = 30, max_notional: float = 90.0) -> dict:
             "account_number": ACCOUNT_NUMBER,
             "strategy": "0dte_options",
             "confluence_score": best.get("score", 0),
-            "quality_score": best.get("quality_score", 0),
+            "probability": best.get("probability", 0),
+            "magnitude": best.get("magnitude", 0),
+            "expected_value": best.get("expected_value", 0),
             "vibe_signal": vibe_signal.get("signal", "unknown"),
             "agents_signal": agents_signal.get("signal", "unknown"),
             "stop_loss": best.get("stop_loss", round(mid_price * 0.50, 4)),
