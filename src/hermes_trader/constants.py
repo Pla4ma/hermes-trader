@@ -34,8 +34,17 @@ MAX_EQUITY_ORDER_NOTIONAL_USD = 500.00  # FIX: was 15, too tight for actual trad
 MAX_POSITION_NOTIONAL_USD = 100.00  # FIX: was 25, too tight for proper sizing
 
 # === Assets ===
-ALLOWED_UNDERLYINGS = {"SPY", "QQQ", "VOO", "DIA", "IWM", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "TQQQ", "SOXL", "SPXL", "UPRO", "TECL", "FNGU", "LABU", "TNA", "AMD", "NFLX"}
-ALLOWED_EQUITY_SYMBOLS = {"SPY", "QQQ", "VOO", "DIA", "IWM", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "TQQQ", "SOXL", "SPXL", "UPRO", "TECL", "FNGU", "LABU", "TNA", "AMD", "NFLX"}
+ALLOWED_UNDERLYINGS = {
+    # Tier 1 — Primary (best liquidity, tightest spreads)
+    "SPY", "QQQ", "IWM", "SMH",
+    # Tier 2 — High Conviction (very liquid, bigger moves)
+    "NVDA", "TSLA", "META", "AAPL", "AMD", "AVGO", "MU", "XLF", "TLT",
+    # Tier 3 — Secondary / Thematic
+    "AMZN", "MSFT", "GOOGL", "NFLX", "PLTR", "RTX", "XLE", "JPM",
+    # Tier 4 — Leveraged / Specialty / Hedge
+    "TQQQ", "SOXL", "TNA", "LABU", "COIN", "IBIT", "GLD",
+}
+ALLOWED_EQUITY_SYMBOLS = ALLOWED_UNDERLYINGS
 ALLOW_EQUITIES = True
 ALLOW_OPTIONS = True
 ALLOW_CRYPTO = False

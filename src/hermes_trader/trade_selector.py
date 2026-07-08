@@ -1,12 +1,13 @@
 """Trade Selector — picks the BEST trade using expected value, not just score.
 
-Improvements from professional trader feedback:
-1. Tier system: Tier 1 (SPY/QQQ/IWM) → Tier 2 (NVDA/TSLA) → Tier 3 → Tier 4
+Based on 3 professional traders' feedback (rated engine 9/10):
+1. Tier system with regime-aware weighting
 2. Expected Return = Prob × Reward - (1-Prob) × Risk - Spread - Theta
-3. Correlation filter: don't trade 4 correlated ETFs simultaneously
-4. Dynamic thresholds: adapt probability requirement to market regime
+3. Correlation filter: no duplicate correlated trades
+4. Dynamic thresholds: adapt to VIX and market regime
 5. Liquidity filter: minimum volume, OI, max spread%
 6. Cooldown: don't re-enter same ticker after stop-out
+7. Sector diversification: AI, semis, rates, gold, financials, crypto
 """
 
 import logging
@@ -19,12 +20,20 @@ logger = logging.getLogger("hermes_trader.trade_selector")
 ET = ZoneInfo("America/New_York")
 
 # ═══════════════════════════════════════════════════════════════
-# TIER SYSTEM — professional trader's universe selection
+# TIER SYSTEM — based on 3 professional traders' recommendations
 # ═══════════════════════════════════════════════════════════════
-TIER_1 = {"SPY", "QQQ", "IWM"}          # Best liquidity, tightest spreads
-TIER_2 = {"NVDA", "TSLA", "META", "AAPL", "AMD"}  # Very liquid, more volatile
-TIER_3 = {"AMZN", "MSFT", "NFLX", "GOOGL"}         # Usually slower
-TIER_4 = {"TQQQ", "SOXL", "TNA", "SPXL", "TECL", "LABU", "UPRO", "FNGU", "VOO", "DIA"}
+
+# Tier 1 — PRIMARY: Best liquidity, tightest spreads, trade first
+TIER_1 = {"SPY", "QQQ", "IWM", "SMH"}
+
+# Tier 2 — HIGH CONVICTION: Very liquid, bigger moves, AI/sector plays
+TIER_2 = {"NVDA", "TSLA", "META", "AAPL", "AMD", "AVGO", "MU", "XLF", "TLT"}
+
+# Tier 3 — SECONDARY / THEMATIC: Good but slower or more specialized
+TIER_3 = {"AMZN", "MSFT", "GOOGL", "NFLX", "PLTR", "RTX", "XLE", "JPM"}
+
+# Tier 4 — LEVERAGED / SPECIALTY / HEDGE: Day trades or hedges only
+TIER_4 = {"TQQQ", "SOXL", "TNA", "LABU", "COIN", "IBIT", "GLD"}
 
 TIER_BONUS = {1: 10, 2: 5, 3: 0, 4: -5}  # Points added/subtracted by tier
 
@@ -32,10 +41,27 @@ TIER_BONUS = {1: 10, 2: 5, 3: 0, 4: -5}  # Points added/subtracted by tier
 # CORRELATION GROUPS — avoid overweighting same trade
 # ═══════════════════════════════════════════════════════════════
 CORRELATION_GROUPS = {
-    "us_equity_index": {"SPY", "QQQ", "VOO", "SPXL", "UPRO", "TQQQ"},
-    "tech_sector": {"NVDA", "AMD", "META", "AAPL", "MSFT", "GOOGL", "NFLX", "TECL", "FNGU"},
-    "semiconductor": {"NVDA", "AMD", "SOXL"},
+    # Index exposure — same macro trade
+    "us_equity_index": {"SPY", "QQQ", "IWM", "TQQQ"},
+    # Semiconductor chain — NVDA GPUs + AVGO custom silicon + MU memory + AMD + SMH sector
+    "semiconductor": {"NVDA", "AMD", "AVGO", "MU", "SMH", "SOXL"},
+    # Mega-cap tech — similar drivers
+    "mega_cap_tech": {"AAPL", "MSFT", "META", "AMZN", "GOOGL", "NFLX"},
+    # Small-cap
     "small_cap": {"IWM", "TNA"},
+    # Financials
+    "financials": {"XLF", "JPM"},
+    # Energy
+    "energy": {"XLE"},
+    # Rates — bond trade
+    "rates": {"TLT"},
+    # Gold — fear hedge
+    "gold": {"GLD"},
+    # Crypto — BTC proxy
+    "crypto": {"COIN", "IBIT"},
+    # Defense
+    "defense": {"RTX"},
+    # Biotech
     "biotech": {"LABU"},
 }
 
