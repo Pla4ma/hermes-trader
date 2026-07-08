@@ -89,8 +89,8 @@ def check_all_gates(
     if not passed:
         failures.append(reason)
 
-    # Gate 5: Volume
-    passed, reason = gate_volume(current_volume, avg_volume_20d)
+    # Gate 5: Volume (with early-session adjustment)
+    passed, reason = gate_volume(current_volume, avg_volume_20d, now_et)
     if not passed:
         failures.append(reason)
 
@@ -105,15 +105,15 @@ def check_all_gates(
         if not passed:
             failures.append(reason)
     
-    # Gate 8: ATR Low (low volatility = skip)
+    # Gate 8: ATR Low (low volatility = skip, early session exempt)
     if atr_14 is not None and open_price > 0:
-        passed, reason = gate_atr_low(atr_14, open_price)
+        passed, reason = gate_atr_low(atr_14, open_price, now_et)
         if not passed:
             failures.append(reason)
     
-    # Gate 9: Gap Fade Risk (large gap up = risk of fade)
+    # Gate 9: Gap Fade Risk (large gap = risk of fade, adaptive on trend days)
     if prev_close is not None and prev_close > 0:
-        passed, reason = gate_gap_fade(spot, prev_close, option_type)
+        passed, reason = gate_gap_fade(spot, prev_close, option_type, high_of_day, low_of_day)
         if not passed:
             failures.append(reason)
 
@@ -264,11 +264,10 @@ def gate_pullback_bounce(spot: float, high_of_day: float, low_of_day: float, opt
 
     day_range = high_of_day - low_of_day
 
-    # Detect trend day: >1% move from open
+    # Detect trend day: >1% intraday range
     move_from_open_pct = 0
     if high_of_day > 0 and low_of_day > 0:
-        mid = (high_of_day + low_of_day) / 2
-        move_from_open_pct = abs(((mid - low_of_day) / low_of_day) * 100) if low_of_day > 0 else 0
+        move_from_open_pct = abs(((high_of_day - low_of_day) / low_of_day) * 100) if low_of_day > 0 else 0
     is_trend_day = move_from_open_pct > 1.0
     
     # On trend days, loosen pullback requirement (trend already confirmed)
@@ -332,19 +331,40 @@ def gate_intraday_structure(spot: float, open_price: float, high_of_day: float, 
     return True, ""
 
 
-def gate_volume(current_volume: float, avg_volume_20d: float) -> Tuple[bool, str]:
+def gate_volume(current_volume: float, avg_volume_20d: float, now_et: datetime = None) -> Tuple[bool, str]:
     """Gate 5: Volume must confirm the move.
 
     If volume is below average, the move lacks conviction.
-    Need at least 50% of average volume to trade.
+    Need at least 50% of expected volume for time of day.
+
+    Early session adjustment: compares to expected volume at this time,
+    not the full-day average. Market opens with ~10% of daily volume in
+    first 15 minutes, ~25% in first hour.
     """
     if avg_volume_20d <= 0:
         return True, ""
 
-    vol_ratio = current_volume / avg_volume_20d
+    # Scale expected volume by time of day
+    if now_et is None:
+        try:
+            from zoneinfo import ZoneInfo
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+        except Exception:
+            now_et = datetime.utcnow()
+
+    minutes_since_open = max((now_et.hour - 9) * 60 + (now_et.minute - 30), 1)
+    total_market_minutes = 390  # 6.5 hours
+    # Volume profile: front-loaded (more volume early)
+    # Use square root scaling: vol_pct = sqrt(elapsed/total)
+    time_fraction = min(minutes_since_open / total_market_minutes, 1.0)
+    vol_pct = time_fraction ** 0.6  # slightly front-loaded
+    expected_volume = avg_volume_20d * vol_pct
+
+    vol_ratio = current_volume / expected_volume if expected_volume > 0 else 0
 
     if vol_ratio < 0.5:
-        return False, f"VOLUME GATE: Volume only {vol_ratio:.1f}x average (need ≥0.5x) — low conviction move"
+        time_str = now_et.strftime("%H:%M")
+        return False, f"VOLUME GATE: Volume only {vol_ratio:.1f}x expected for {time_str} (need >=0.5x) — low conviction move"
 
     return True, ""
 
@@ -395,16 +415,31 @@ def gate_vwap_chop(spot: float, vwap: float, option_type: str) -> Tuple[bool, st
     return True, ""
 
 
-def gate_atr_low(atr_14: float, open_price: float) -> Tuple[bool, str]:
+def gate_atr_low(atr_14: float, open_price: float, now_et: datetime = None) -> Tuple[bool, str]:
     """Gate 8: Low ATR = skip trading.
     
     ATR measures volatility. If ATR is too low relative to price,
     the market is too quiet for 0DTE options to be profitable.
     
     Threshold: ATR should be > 0.3% of price for 0DTE trading.
+    
+    Early session: skip this gate in first 30 minutes (insufficient
+    5m bars for reliable ATR calculation).
     """
     if open_price <= 0:
         return True, ""
+    
+    # Skip ATR gate in first 30 minutes (not enough 5m bars)
+    if now_et is None:
+        try:
+            from zoneinfo import ZoneInfo
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+        except Exception:
+            now_et = datetime.utcnow()
+    
+    minutes_since_open = (now_et.hour - 9) * 60 + (now_et.minute - 30)
+    if minutes_since_open < 30:
+        return True, ""  # skip — insufficient intraday data
     
     atr_pct = (atr_14 / open_price) * 100
     
@@ -414,14 +449,19 @@ def gate_atr_low(atr_14: float, open_price: float) -> Tuple[bool, str]:
     return True, ""
 
 
-def gate_gap_fade(spot: float, prev_close: float, option_type: str) -> Tuple[bool, str]:
+def gate_gap_fade(spot: float, prev_close: float, option_type: str, 
+                   high_of_day: float = 0, low_of_day: float = 0) -> Tuple[bool, str]:
     """Gate 9: Large gap = risk of fade.
     
     If SPY gapped up >0.5% overnight, there's a high probability
     of a fade (pullback) during the day. Don't buy calls into a gap.
     
-    For CALLS: Block if gap up >0.5% (fade risk)
-    For PUTS: Block if gap down >0.5% (bounce risk)
+    ADAPTIVE: On trend days where the gap is FOLLOWING THROUGH
+    (price hasn't bounced back), allow the trade. Only block if
+    the gap is filling (price reverting toward prev close).
+    
+    For CALLS: Block if gap up >0.5% AND price fading (below 50% of gap)
+    For PUTS: Block if gap down >0.5% AND price bouncing (above 50% of gap)
     """
     if prev_close <= 0:
         return True, ""
@@ -430,9 +470,20 @@ def gate_gap_fade(spot: float, prev_close: float, option_type: str) -> Tuple[boo
     
     if option_type == "call":
         if gap_pct > 0.5:
-            return False, f"GAP FADE GATE: Calls blocked — SPY gapped up {gap_pct:.2f}% (high fade risk)"
+            # Check if gap is following through or fading
+            if high_of_day > 0 and low_of_day > 0:
+                # If spot is still near the high, gap is holding (OK for calls)
+                day_range = high_of_day - low_of_day
+                if day_range > 0 and (spot - low_of_day) / day_range > 0.7:
+                    return True, ""  # gap holding, allow
+            return False, f"GAP FADE GATE: Calls blocked — gapped up {gap_pct:.2f}% (high fade risk)"
     elif option_type == "put":
         if gap_pct < -0.5:
-            return False, f"GAP FADE GATE: Puts blocked — SPY gapped down {gap_pct:.2f}% (high bounce risk)"
+            # Check if gap is following through or bouncing
+            if high_of_day > 0 and low_of_day > 0:
+                day_range = high_of_day - low_of_day
+                if day_range > 0 and (spot - low_of_day) / day_range < 0.3:
+                    return True, ""  # gap holding near low, allow puts
+            return False, f"GAP FADE GATE: Puts blocked — gapped down {gap_pct:.2f}% (high bounce risk)"
     
     return True, ""

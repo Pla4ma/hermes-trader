@@ -656,7 +656,7 @@ class DailyWorkflow:
                 expiration_exit_rule="Force close 0DTE by 3:45 PM",
             ),
             confidence=ConfidenceInfo(
-                score_0_to_100=score_0dte,
+                score_0_to_100=int(score_0dte),
                 label=confidence_label,
                 reason=f"0DTE scan score={score_0dte:.1f}, delta={best.get('delta', 0):.4f}",
             ),
