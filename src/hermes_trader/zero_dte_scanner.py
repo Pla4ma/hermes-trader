@@ -200,7 +200,11 @@ def get_option_instruments(
 
 
 def get_option_quotes(instrument_ids: list[str]) -> list[dict]:
-    """Get real-time quotes for option contracts (batches of 20)."""
+    """Get real-time quotes for option contracts (batches of 20).
+
+    Robinhood MCP returns nested structure: {'results': [{'quote': {...}, 'close': {...}}]}
+    This function unwraps to return flat list of quote dicts with mark_price, volume, etc.
+    """
     all_quotes: list[dict] = []
     batch_size = 20
     for i in range(0, len(instrument_ids), batch_size):
@@ -210,9 +214,18 @@ def get_option_quotes(instrument_ids: list[str]) -> list[dict]:
         try:
             data = _mcp_call("get_option_quotes", {"instrument_ids": batch})
             if isinstance(data, dict):
-                all_quotes.extend(data.get("results", []))
+                for r in data.get("results", []):
+                    # Unwrap: Robinhood returns {quote: {...}, close: {...}}
+                    if isinstance(r, dict) and "quote" in r:
+                        all_quotes.append(r["quote"])
+                    else:
+                        all_quotes.append(r)
             elif isinstance(data, list):
-                all_quotes.extend(data)
+                for r in data:
+                    if isinstance(r, dict) and "quote" in r:
+                        all_quotes.append(r["quote"])
+                    else:
+                        all_quotes.append(r)
         except Exception as e:
             logger.warning(f"Quote batch failed (batch {i//batch_size}): {e}")
     return all_quotes
@@ -366,6 +379,7 @@ def score_option(
         "option_id": option_id,
         "symbol": symbol,
         "option_type": option_type,
+        "type": option_type,  # Alias for trade_selector compatibility
         "strike": round(strike, 2),
         "expiration_date": expiration_date,
         "bid": round(bid, 4),
@@ -380,6 +394,7 @@ def score_option(
         "distance_pct": round(distance_pct, 3),
         "spot": spot,
         "score": min(total, 100),
+        "probability": max(0.3, min(0.9, 0.5 + abs(delta) * 0.5)),  # Estimate from delta
         "score_delta": round(score_delta, 1),
         "score_gamma": round(score_gamma, 1),
         "score_volume": round(score_volume, 1),

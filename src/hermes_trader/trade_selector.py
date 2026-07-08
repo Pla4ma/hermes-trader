@@ -248,13 +248,20 @@ def select_best_trade(
         # Expected return (use candidate's EV if available, else estimate)
         ev = c.get("expected_value", 0)
         if ev == 0:
-            # Estimate: probability × typical reward - (1-prob) × typical risk
+            # Estimate based on actual spread and delta
+            spread_cost = c.get("spread_pct", 2.0) / 100  # Convert % to decimal
+            delta = abs(c.get("delta", 0.40))
+            # For long options: reward scales with delta, risk = premium
+            # Typical 0DTE: 40-80% reward if direction correct, 100% loss if wrong
+            reward_pct = 0.40 + (delta * 0.20)  # Higher delta = higher reward potential
+            risk_pct = 0.60  # Typical loss if wrong direction
+            theta_cost = 0.02  # Hourly theta decay estimate
             ev = calculate_expected_return(
                 probability=prob,
-                reward_pct=0.30,   # typical 30% gain on 0DTE
-                risk_pct=0.50,     # typical 50% loss on 0DTE
-                spread_pct=0.02,   # ~2% spread cost
-                theta_decay_pct=0.05,  # ~5% theta per hour for 0DTE
+                reward_pct=reward_pct,
+                risk_pct=risk_pct,
+                spread_pct=spread_cost,
+                theta_decay_pct=theta_cost,
             )
         
         # Apply tier bonus
