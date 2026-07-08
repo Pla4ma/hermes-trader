@@ -127,31 +127,39 @@ def check_all_gates(
 def gate_time(now_et: datetime) -> Tuple[bool, str]:
     """Gate 1: Only trade during optimal windows.
 
-    Windows:
-      - 9:35-10:30 AM ET (early momentum — biggest moves happen here)
-      - 2:00-3:30 PM ET (afternoon trend, before power hour chaos)
+    Based on professional trader's proven timing:
 
-    BLOCKS:
+    PRIMARY WINDOWS (best setups, highest win rate):
+      - 9:35-10:15 AM ET (early momentum — THE money window)
+      - 2:30-4:00 PM ET (afternoon trend, power hour setup)
+
+    SECONDARY WINDOW (good but not great):
+      - 10:15-11:30 AM ET (post-ORB continuation)
+
+    BLOCKED:
       - 9:30-9:35 (first 5 min = pure chaos, algo wars, wide spreads)
-      - 10:30-2:00 PM (lunch chop, low conviction)
-      - After 3:30 PM (theta crush, pin risk)
-
-    NOTE: Changed from 9:45 to 9:35 because the biggest moves (like
-    today's QQQ -2% crash) happen in the first 15 minutes. Waiting
-    until 9:45 means missing the real money.
+      - 11:30-2:30 PM (lunch chop, dead zone, no conviction)
+      - After 4:00 PM (market closed)
     """
     hour = now_et.hour
     minute = now_et.minute
 
-    # Morning window: 9:35 - 10:30 (was 9:45, moved earlier to catch early moves)
-    morning_ok = (hour == 9 and minute >= 35) or (hour == 10 and minute <= 30)
-    # Afternoon window: 2:00 - 3:30
-    afternoon_ok = (hour == 14) or (hour == 15 and minute <= 30)
+    # Convert to minutes since midnight for cleaner comparisons
+    t = hour * 60 + minute
 
-    if morning_ok or afternoon_ok:
+    # PRIMARY: 9:35-10:15 AM (575 to 615 min)
+    primary_morning = (575 <= t <= 615)
+    # SECONDARY: 10:15-11:30 AM (615 to 690 min)
+    secondary_morning = (615 < t <= 690)
+    # PRIMARY: 2:30-4:00 PM (870 to 960 min)
+    primary_afternoon = (870 <= t <= 960)
+
+    if primary_morning or primary_afternoon:
         return True, ""
+    if secondary_morning:
+        return True, ""  # secondary — still allowed
 
-    return False, f"TIME GATE: {hour:02d}:{minute:02d} ET — outside optimal windows (9:45-10:30, 2:00-3:30)"
+    return False, f"TIME GATE: {hour:02d}:{minute:02d} ET — outside windows (primary: 9:35-10:15, 2:30-4:00; secondary: 10:15-11:30)"
 
 
 def gate_extended_move(spot: float, open_price: float, high_of_day: float, low_of_day: float, option_type: str) -> Tuple[bool, str]:
