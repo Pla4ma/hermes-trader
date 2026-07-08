@@ -36,7 +36,7 @@ MIN_PREMIUM_MID = 0.50
 MAX_PREMIUM_MID = 5.00
 
 # Top N candidates to return
-TOP_N = 3
+TOP_N = 20
 
 # Scoring weights (total = 100)
 W_DELTA = 25    # Ideal delta 0.20–0.40 for directional 0DTE
@@ -517,6 +517,24 @@ def scan_0dte(
                     instruments = get_option_instruments(symbol, exp_date, opt_type)
                     if not instruments:
                         continue
+
+                    # FILTER: Only keep ATM options (within $5 of spot)
+                    # This prevents fetching 124 instruments per symbol which triggers rate limits
+                    atm_instruments = []
+                    for inst in instruments:
+                        strike = _safe_float(inst, "strike_price", "strike")
+                        if abs(strike - spot) <= 5.0:
+                            atm_instruments.append(inst)
+                    
+                    # Fallback: if no ATM options found, keep top 10 by closeness to spot
+                    if not atm_instruments and instruments:
+                        sorted_insts = sorted(
+                            instruments,
+                            key=lambda i: abs(_safe_float(i, "strike_price", "strike") - spot)
+                        )
+                        atm_instruments = sorted_insts[:10]
+                    
+                    instruments = atm_instruments
 
                     # Collect instrument IDs for batch quote fetch
                     id_map: dict[str, dict] = {}
