@@ -48,6 +48,12 @@ from .options_flow import get_flow_sentiment
 from .dealer_positioning import quick_dealer_check
 from .multi_timeframe import combine_all as mtf_combine_all
 
+# ── 0DTE Scanner & Exit Safety (production wiring) ──
+from .zero_dte_scanner import scan_0dte, get_spot_price
+from .trade_selector import select_best_trade
+from .smart_exits import calculate_smart_exit
+from .zero_dte_exits import ZeroDTEExitManager, PositionSnapshot, ExitAction
+
 logger = logging.getLogger("hermes_trader.workflow")
 
 
@@ -192,6 +198,182 @@ class DailyWorkflow:
         
         return False, f"BLOCKED: {candidate.asset_class} not eligible for auto-trade"
 
+    def _scan_0dte_candidates(self) -> list[dict]:
+        """Scan 0DTE options via zero_dte_scanner for day-trade candidates.
+        
+        Returns list of scored candidate dicts from the 0DTE scanner.
+        These candidates include option_id, strike, expiry, bid/ask, greeks, etc.
+        """
+        try:
+            candidates = scan_0dte(
+                max_candidates=15,
+                min_score=25.0,
+            )
+            logger.info(f"0DTE scan found {len(candidates)} candidates")
+            return candidates
+        except Exception as e:
+            logger.warning(f"0DTE scan failed: {e}")
+            return []
+
+    def _select_best_from_candidates(
+        self, candidates: list[dict], open_positions: list[dict] = None
+    ) -> Optional[dict]:
+        """Use trade_selector to pick the single best trade from candidates.
+        
+        Applies dynamic thresholds, correlation filter, liquidity filter,
+        tier bonuses, and cooldown checks.
+        """
+        if not candidates:
+            return None
+        try:
+            # Get VIX level for dynamic thresholds
+            vix_level = 20.0
+            try:
+                from .vol_regime import fetch_vol_regime
+                vr = fetch_vol_regime()
+                vix_level = vr.get("vix_current", 20.0) if vr else 20.0
+            except Exception:
+                pass
+
+            best = select_best_trade(
+                candidates=candidates,
+                vix_level=vix_level,
+                open_positions=open_positions,
+            )
+            if best:
+                logger.info(
+                    f"trade_selector picked: {best.get('symbol')} "
+                    f"{best.get('type', 'call')} strike={best.get('strike', 0)} "
+                    f"score={best.get('score', 0):.1f} "
+                    f"EV={best.get('_ev', 0):.4f}"
+                )
+            return best
+        except Exception as e:
+            logger.warning(f"trade_selector failed, falling back to score sort: {e}")
+            # Fallback: just sort by score
+            candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
+            return candidates[0] if candidates else None
+
+    def manage_exits(self) -> dict:
+        """Manage exits for all open positions using 0DTE + smart exits.
+        
+        Pipeline:
+        1. Fetch open positions from broker
+        2. For 0DTE positions: use ZeroDTEExitManager
+        3. For non-0DTE: use smart_exits.calculate_smart_exit()
+        4. Execute exit orders via broker
+        """
+        from datetime import timezone, timedelta
+
+        broker = self.broker
+        positions = broker.list_positions()
+        actions = []
+        exit_mgr = ZeroDTEExitManager()
+        now_utc = datetime.now(timezone.utc)
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
+        for pos in positions:
+            symbol = pos.get("symbol", "")
+            if not symbol:
+                continue
+
+            entry = float(pos.get("avg_entry_price", 0) or pos.get("average_entry_price", 0) or 0)
+            current = float(pos.get("current_price", 0) or pos.get("last_price", 0) or 0)
+            qty = int(float(pos.get("quantity", 0) or pos.get("qty", 0) or 0))
+            option_id = pos.get("option_id", "")
+
+            if entry <= 0 or qty <= 0:
+                continue
+
+            pnl_pct = ((current / entry) - 1) * 100
+
+            # ── 0DTE positions: use ZeroDTEExitManager ──
+            expiration = pos.get("expiration_date", pos.get("expiration", ""))
+            is_0dte = (expiration == today_str) if expiration else False
+
+            if is_0dte and option_id:
+                pos_snapshot = PositionSnapshot(
+                    option_id=option_id,
+                    symbol=symbol,
+                    option_type=pos.get("option_type", pos.get("type", "call")),
+                    quantity=qty,
+                    entry_price=entry,
+                    current_price=current,
+                    strike=float(pos.get("strike", 0)),
+                    expiration=expiration,
+                    price_history=[],
+                    half_sold=pos.get("half_sold", False),
+                    entry_time=None,
+                )
+                signal = exit_mgr.evaluate(pos_snapshot, now_utc)
+                if signal and signal.action.value != ExitAction.NO_ACTION.value:
+                    try:
+                        sell_qty = min(signal.quantity, qty)
+                        exit_price = signal.exit_price or round(current * 0.95, 4)
+                        exit_price = max(round(exit_price, 4), 0.01)
+
+                        order = broker.place_option_order(
+                            option_id=option_id,
+                            side="sell",
+                            quantity=sell_qty,
+                            limit_price=str(exit_price),
+                            time_in_force="day",
+                        )
+                        action_type = signal.action.value.upper()
+                        actions.append({
+                            "symbol": symbol,
+                            "action": f"0DTE_{action_type}",
+                            "reason": signal.reason.value if hasattr(signal.reason, 'value') else str(signal.reason),
+                            "quantity": sell_qty,
+                            "pnl_pct": round(signal.pnl_pct, 2),
+                            "pnl_dollars": round(signal.pnl_dollars, 2),
+                            "order_id": order.get("order_id", ""),
+                        })
+                        logger.info(f"0DTE EXIT: {symbol} {action_type} P&L={signal.pnl_pct:+.1f}%")
+                    except Exception as e:
+                        actions.append({"symbol": symbol, "action": "0DTE_EXIT_ERROR", "error": str(e)})
+                    continue
+
+            # ── Non-0DTE: use smart_exits ──
+            spot = 0.0
+            try:
+                spot = get_spot_price(symbol)
+            except Exception:
+                pass
+
+            smart = calculate_smart_exit(
+                entry_price=entry,
+                current_price=current,
+                spot=spot,
+                strike=float(pos.get("strike", 0)),
+                option_type=pos.get("option_type", pos.get("type", "call")),
+            )
+
+            exit_action = smart.get("action", "hold")
+            if exit_action in ("sell_all", "sell_half"):
+                sell_qty = qty if exit_action == "sell_all" else max(1, qty // 2)
+                if option_id:
+                    try:
+                        order = broker.place_option_order(
+                            option_id=option_id,
+                            side="sell",
+                            quantity=sell_qty,
+                            limit_price=str(max(round(current * 0.95, 4), 0.01)),
+                            time_in_force="day",
+                        )
+                        actions.append({
+                            "symbol": symbol,
+                            "action": f"SMART_{exit_action.upper()}",
+                            "reason": smart.get("reason", ""),
+                            "quantity": sell_qty,
+                            "pnl_pct": round(pnl_pct, 2),
+                            "order_id": order.get("order_id", ""),
+                        })
+                    except Exception as e:
+                        actions.append({"symbol": symbol, "action": "SMART_EXIT_ERROR", "error": str(e)})
+
+        return {"timestamp": datetime.utcnow().isoformat(), "actions": actions}
+
     def run_research_cycle(self, symbols: list[str] = None) -> dict:
         """Run Vibe-Trading + TradingAgents research for given symbols."""
         if symbols is None:
@@ -311,8 +493,8 @@ class DailyWorkflow:
     def run(self, research_result: Optional[dict] = None) -> dict:
         """Run the full daily cycle.
 
-        PIPELINE: research -> enrichment -> candidate -> gates -> score -> execute
-        ONE ENGINE, ONE PIPELINE -- all signals flow through in sequence.
+        PIPELINE: research → enrich → scan_0DTE → enrich_candidates → 
+                   select_best → gates → score → execute → monitor → exit
 
         Args:
             research_result: Optional pre-computed research. If None, a
@@ -336,14 +518,49 @@ class DailyWorkflow:
         # -- Phase 2: Enrich research with flow/dealer/timeframe signals --
         research_result = self._enrich_research(research_result)
 
-        # -- Phase 3: Build candidate from enriched research --
-        candidate = self._build_candidate(research_result)
-        if candidate.strategy == "no_trade":
-            logger.info("No-trade candidate generated. Logging and exiting.")
-            self._log_decision(candidate, PolicyResult(status="NO_TRADE", reasons=["No research provided"], allowed_action="none"))
-            return self._build_report(candidate, None, None)
+        # -- Phase 3: Scan 0DTE candidates (zero_dte_scanner) --
+        candidates_0dte = self._scan_0dte_candidates()
 
-        # -- Phase 4: MAX POWER Filters (vol regime, correlation, news, portfolio risk, entry gates) --
+        # -- Phase 4: Enrich 0DTE candidates with research signals --
+        research_data = research_result.get("research", {})
+        for c in candidates_0dte:
+            sym = c.get("symbol", "SPY")
+            if sym in research_data:
+                r = research_data[sym]
+                # Add research signals to 0DTE candidates
+                c["research_signal"] = r.get("signal", "neutral")
+                c["research_confidence"] = r.get("confidence_score", 0)
+                c["research_flow_sentiment"] = r.get("flow_sentiment", "neutral")
+                c["research_mtf_go_trade"] = r.get("mtf_go_trade", False)
+                # Boost score if research confirms direction
+                c_type = c.get("type", "call")
+                r_signal = r.get("signal", "neutral")
+                if (c_type == "call" and r_signal == "bullish") or \
+                   (c_type == "put" and r_signal == "bearish"):
+                    c["score"] = c.get("score", 0) + 10  # research bonus
+                elif r_signal != "neutral":
+                    c["score"] = c.get("score", 0) - 5  # research penalty
+
+        # -- Phase 5: Select best trade via trade_selector --
+        if candidates_0dte:
+            best_candidate = self._select_best_from_candidates(candidates_0dte)
+        else:
+            # Fallback: build candidate from research only
+            logger.info("No 0DTE candidates from scanner, falling back to research candidate")
+            best_candidate = None
+
+        # If no 0DTE candidate, fall back to research-based candidate
+        if best_candidate is None:
+            candidate = self._build_candidate(research_result)
+            if candidate.strategy == "no_trade":
+                logger.info("No-trade candidate generated. Logging and exiting.")
+                self._log_decision(candidate, PolicyResult(status="NO_TRADE", reasons=["No candidates from 0DTE scanner or research"], allowed_action="none"))
+                return self._build_report(candidate, None, None)
+        else:
+            # Build TradeCandidate from 0DTE scanner result
+            candidate = self._build_candidate_from_0dte(best_candidate, research_result)
+
+        # -- Phase 6: MAX POWER Filters (vol regime, correlation, news, portfolio risk, entry gates) --
         max_power_passed, max_power_reason = self._run_max_power_filters(candidate)
         if not max_power_passed:
             logger.warning(f"MAX POWER filter blocked: {max_power_reason}")
@@ -355,29 +572,101 @@ class DailyWorkflow:
             self._log_decision(candidate, result, None)
             return self._build_report(candidate, result, None)
 
-        # -- Phase 5: Score --
+        # -- Phase 7: Score --
         score = self.scoring.score(candidate)
         logger.info(f"Candidate scored: {score.total}/100 (tier: {score.tier})")
 
-        # -- Phase 6: Fetch account/market/risk state --
+        # -- Phase 8: Fetch account/market/risk state --
         account = self.broker.get_account()
         market = self.broker.get_market_snapshot(candidate.underlying)
         risk_snapshot = self.broker.get_risk_snapshot()
 
-        # -- Phase 7: Policy evaluation --
+        # -- Phase 9: Policy evaluation --
         result = self.policy.evaluate(candidate, account, market, risk_snapshot, score)
         logger.info(f"Policy result: {result.status} | Action: {result.allowed_action}")
 
-        # -- Phase 8: Execute if approved --
+        # -- Phase 10: Execute if approved --
         order_result = None
         if result.is_approved or result.can_execute:
             order_result = self._execute(candidate, result)
 
-        # -- Phase 9: Journal --
+        # -- Phase 11: Journal --
         self._log_decision(candidate, result, score)
 
-        # -- Phase 10: Report --
-        return self._build_report(candidate, result, score, order_result, account)
+        # -- Phase 12: Monitor exits for existing positions --
+        exit_result = self.manage_exits()
+
+        # -- Phase 13: Report --
+        report = self._build_report(candidate, result, score, order_result, account)
+        report["exit_actions"] = exit_result.get("actions", [])
+        return report
+
+    def _build_candidate_from_0dte(self, best: dict, research_result: Optional[dict] = None) -> TradeCandidate:
+        """Build a TradeCandidate from a 0DTE scanner result.
+        
+        Maps the 0DTE scanner's candidate dict fields to TradeCandidate model.
+        """
+        now = datetime.utcnow().isoformat()
+        cid = f"cand_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        
+        symbol = best.get("symbol", "SPY")
+        option_type = best.get("type", "call")
+        direction = "bullish" if option_type == "call" else "bearish"
+        strategy = "long_call" if option_type == "call" else "long_put"
+        
+        score_0dte = best.get("score", 0)
+        confidence_label = "high" if score_0dte >= 70 else "medium" if score_0dte >= 50 else "low"
+        
+        return TradeCandidate(
+            candidate_id=cid,
+            created_at=now,
+            mode=config.trader_mode,
+            underlying=symbol,
+            symbol=symbol,
+            asset_class="option",
+            strategy=strategy,
+            direction=direction,
+            action="open",
+            order=OrderDetails(
+                side="buy",
+                order_type="limit",
+                quantity=1,
+                notional_usd=best.get("cost_per_contract", 0),
+                limit_price=best.get("mid", 0),
+            ),
+            risk=RiskDetails(
+                max_loss_usd=best.get("cost_per_contract", 0),
+                expected_loss_usd=best.get("cost_per_contract", 0) * 0.5,
+                max_profit_usd=best.get("cost_per_contract", 0) * 2.0,
+                risk_reward_ratio=2.0,
+                position_notional_usd=best.get("cost_per_contract", 0),
+            ),
+            evidence=EvidencePack(
+                market_data_timestamp=now,
+                vibe_summary=best.get("research_flow_sentiment", ""),
+                tradingagents_summary=f"score={score_0dte:.1f} delta={best.get('delta', 0):.4f}",
+                bull_case=f"0DTE {option_type} {symbol} K={best.get('strike', 0)}",
+                bear_case="",
+                risk_case="0DTE theta decay",
+            ),
+            exit_plan=ExitPlan(
+                profit_take_rule="50% at +50%, all at +100%",
+                stop_loss_rule="-50% hard stop",
+                time_exit_rule="30 min before close",
+                expiration_exit_rule="Force close 0DTE by 3:45 PM",
+            ),
+            confidence=ConfidenceInfo(
+                score_0_to_100=score_0dte,
+                label=confidence_label,
+                reason=f"0DTE scan score={score_0dte:.1f}, delta={best.get('delta', 0):.4f}",
+            ),
+            option_details=OptionDetails(
+                option_type=option_type,
+                days_to_expiration=0,
+                strike=best.get("strike", 0),
+                expiration_date=best.get("expiration_date", datetime.now().strftime("%Y-%m-%d")),
+            ),
+        )
 
     def _pick_best_symbol(self, research_result: dict) -> Optional[dict]:
         """Pick the best trading candidate from per-symbol research data.

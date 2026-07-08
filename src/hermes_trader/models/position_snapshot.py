@@ -14,6 +14,8 @@ class PositionSnapshot(BaseModel):
     unrealized_plpc: float
     side: str = "long"
     asset_class: str = "equity"
+    entry_price: Optional[float] = None
+    entry_time: Optional[str] = None
 
 
 class AccountSnapshot(BaseModel):

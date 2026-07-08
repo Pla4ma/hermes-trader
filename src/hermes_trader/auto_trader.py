@@ -1099,21 +1099,31 @@ def _load_optimal_params(symbol: str) -> dict:
 
 
 def manage_exits() -> dict:
-    """Check option positions and manage exits with SMART + trailing stops.
+    """Check option positions and manage exits with 0DTE + SMART exit rules.
 
-    Uses smart_exits.py for intelligent exit timing:
-    - Sells into strength, not weakness
-    - Uses VWAP, RSI, time decay for decisions
-    - Sells half at +50%, trails rest
-    - Hard close at 3:30 PM ET (0DTE theta crush)
-    - Momentum fade detection
-    
+    Uses zero_dte_exits.ZeroDTEExitManager for 0DTE-specific exits:
+    - Time stop: force-close at 3:45 PM ET
+    - Profit target 1: sell 50% at +50%
+    - Profit target 2: sell rest at +100%
+    - Stop loss: close entire position at -50%
+    - Momentum exit: close if drops 30% in 5-min window
+
+    Uses smart_exits.calculate_smart_exit() for general exit intelligence.
+
     All orders routed through Robinhood MCP broker adapter.
     """
+    from .zero_dte_exits import ZeroDTEExitManager, PositionSnapshot, PriceSnapshot
+    from .smart_exits import calculate_smart_exit
+    from datetime import timezone, timedelta
+
     broker = _get_broker()
     positions = broker.list_positions()
     open_orders = broker.list_open_orders()
     actions = []
+
+    # Initialize the 0DTE exit manager
+    exit_mgr = ZeroDTEExitManager()
+    now_utc = datetime.now(timezone.utc)
 
     # Get symbols with existing exit orders
     exit_symbols = {o.get("symbol", "") for o in open_orders}
@@ -1125,103 +1135,178 @@ def manage_exits() -> dict:
 
         entry = float(pos.get("avg_entry_price", 0) or pos.get("average_entry_price", 0) or 0)
         current = float(pos.get("current_price", 0) or pos.get("last_price", 0) or 0)
-        qty = float(pos.get("quantity", 0) or pos.get("qty", 0) or 0)
+        qty = int(float(pos.get("quantity", 0) or pos.get("qty", 0) or 0))
+        option_id = pos.get("option_id", "")
 
         if entry <= 0 or qty <= 0:
             continue
 
         pnl_pct = (current / entry - 1) * 100 if entry > 0 else 0
-        
-        # ── Trailing stop logic for options ──
-        if pnl_pct >= 30:
-            # Tighten stop to trail by 20% (for high-vol options)
-            new_sl = round(current * 0.80, 4)
-            old_sl = round(entry * 0.50, 4)
-            if new_sl > old_sl:
-                # Cancel existing exit orders for this symbol
-                for o in open_orders:
-                    if o.get("symbol", "") == symbol:
-                        try:
-                            broker.cancel_order(o.get("order_id", o.get("id", "")))
-                            # Removed blocking sleep — was 0.5s per order, stalls exits during vol spikes
-                            pass
-                        except Exception:
-                            pass
 
-                # Place new trailing stop order via Robinhood MCP (option order)
+        # ── Build 0DTE PositionSnapshot for exit evaluation ──
+        # Detect 0DTE by checking if expiration is today
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        expiration = pos.get("expiration_date", pos.get("expiration", ""))
+        is_0dte = (expiration == today_str) if expiration else False
+
+        if is_0dte and option_id:
+            # ── ZeroDTEExitManager evaluation (0DTE-specific rules) ──
+            pos_snapshot = PositionSnapshot(
+                option_id=option_id,
+                symbol=symbol,
+                option_type=pos.get("option_type", pos.get("type", "call")),
+                quantity=qty,
+                entry_price=entry,
+                current_price=current,
+                strike=float(pos.get("strike", 0)),
+                expiration=expiration,
+                price_history=[],  # Would need historical price data
+                half_sold=pos.get("half_sold", False),
+                entry_time=None,
+            )
+
+            signal = exit_mgr.evaluate(pos_snapshot, now_utc)
+            if signal and signal.action.value != "no_action":
+                # Execute the exit signal
                 try:
-                    # Get the option_id from the position
-                    option_id = pos.get("option_id", "")
-                    if not option_id:
-                        actions.append({"symbol": symbol, "action": "SL_ERROR", "error": "No option_id in position"})
-                        continue
-                    
+                    sell_qty = signal.quantity
+                    if sell_qty > qty:
+                        sell_qty = qty
+
+                    exit_price = signal.exit_price or round(current * 0.95, 4)
+                    exit_price = max(round(exit_price, 4), 0.01)
+
+                    order = broker.place_option_order(
+                        option_id=option_id,
+                        side="sell",
+                        quantity=sell_qty,
+                        limit_price=str(exit_price),
+                        time_in_force="day",
+                    )
+                    action_type = signal.action.value.upper()
+                    actions.append({
+                        "symbol": symbol,
+                        "action": f"0DTE_{action_type}",
+                        "reason": signal.reason.value if hasattr(signal.reason, 'value') else str(signal.reason),
+                        "quantity": sell_qty,
+                        "pnl_pct": round(signal.pnl_pct, 2),
+                        "pnl_dollars": round(signal.pnl_dollars, 2),
+                        "exit_price": exit_price,
+                        "order_id": order.get("order_id", ""),
+                        "signals": signal.signals,
+                    })
+                    logger.info(
+                        f"0DTE EXIT: {symbol} {action_type} qty={sell_qty} "
+                        f"P&L={signal.pnl_pct:+.1f}% reason={signal.reason}"
+                    )
+                    _notify_trade("SELL_OPTION", {
+                        "symbol": symbol,
+                        "pnl": round(signal.pnl_dollars, 2),
+                        "pnl_pct": round(signal.pnl_pct, 2),
+                        "reason": signal.reason.value if hasattr(signal.reason, 'value') else str(signal.reason),
+                    })
+                except Exception as e:
+                    actions.append({"symbol": symbol, "action": "0DTE_EXIT_ERROR", "error": str(e)})
+                    logger.error(f"0DTE exit failed for {symbol}: {e}")
+                continue  # Skip legacy exit logic for 0DTE positions
+
+        # ── Legacy exit logic for non-0DTE positions (using smart_exits) ──
+        spot = 0.0
+        strike = float(pos.get("strike", 0))
+        option_type = pos.get("option_type", pos.get("type", "call"))
+
+        try:
+            spot = get_spot_price(symbol)
+        except Exception:
+            pass
+
+        smart_exit = calculate_smart_exit(
+            entry_price=entry,
+            current_price=current,
+            spot=spot,
+            strike=strike,
+            option_type=option_type,
+        )
+
+        exit_action = smart_exit.get("action", "hold")
+        exit_reason = smart_exit.get("reason", "")
+
+        if exit_action in ("sell_all", "sell_half"):
+            sell_qty = qty
+            if exit_action == "sell_half":
+                sell_qty = max(1, qty // 2)
+
+            if option_id:
+                try:
+                    exit_price = max(round(current * 0.95, 4), 0.01)
+                    order = broker.place_option_order(
+                        option_id=option_id,
+                        side="sell",
+                        quantity=sell_qty,
+                        limit_price=str(exit_price),
+                        time_in_force="day",
+                    )
+                    actions.append({
+                        "symbol": symbol,
+                        "action": f"SMART_{exit_action.upper()}",
+                        "reason": exit_reason,
+                        "quantity": sell_qty,
+                        "pnl_pct": round(pnl_pct, 2),
+                        "order_id": order.get("order_id", ""),
+                    })
+                    _notify_trade("SELL_OPTION", {
+                        "symbol": symbol,
+                        "pnl": round((current - entry) * sell_qty, 2),
+                        "pnl_pct": round(pnl_pct, 2),
+                        "reason": exit_reason,
+                    })
+                except Exception as e:
+                    actions.append({"symbol": symbol, "action": "SMART_EXIT_ERROR", "error": str(e)})
+
+        elif exit_action == "tighten_stop" and symbol not in exit_symbols:
+            # Tighten stop to breakeven
+            if option_id:
+                try:
+                    sl_price = smart_exit.get("stop_price", round(entry * 1.02, 4))
                     order = broker.place_option_order(
                         option_id=option_id,
                         side="sell",
                         quantity=max(1, int(qty)),
-                        limit_price=str(round(current, 4)),
+                        limit_price=str(round(sl_price, 4)),
                         time_in_force="day",
                     )
                     actions.append({
-                        "symbol": symbol, "action": "TRAILING_SL",
-                        "old_sl": old_sl, "new_sl": new_sl,
+                        "symbol": symbol, "action": "SMART_TIGHTEN_SL",
+                        "price": sl_price,
+                        "reason": exit_reason,
+                        "pnl_pct": round(pnl_pct, 2),
+                        "order_id": order.get("order_id", ""),
+                    })
+                except Exception as e:
+                    actions.append({"symbol": symbol, "action": "SMART_SL_ERROR", "error": str(e)})
+
+        elif symbol not in exit_symbols:
+            # No exit order — set initial stop at 50% loss
+            sl_price = round(entry * 0.50, 4)
+            if option_id:
+                try:
+                    order = broker.place_option_order(
+                        option_id=option_id,
+                        side="sell",
+                        quantity=max(1, int(qty)),
+                        limit_price=str(round(sl_price, 4)),
+                        time_in_force="day",
+                    )
+                    actions.append({
+                        "symbol": symbol, "action": "SL_SET",
+                        "price": sl_price,
                         "pnl_pct": round(pnl_pct, 2),
                         "order_id": order.get("order_id", ""),
                     })
                 except Exception as e:
                     actions.append({"symbol": symbol, "action": "SL_ERROR", "error": str(e)})
 
-        elif pnl_pct <= -50:
-            # Hard stop-loss: use limit at current bid for fast fill, avoid market slippage
-            try:
-                option_id = pos.get("option_id", "")
-                if not option_id:
-                    actions.append({"symbol": symbol, "action": "SL_ERROR", "error": "No option_id in position"})
-                    continue
-                
-                # Use limit at current bid (slightly below current) to ensure fill
-                stop_limit_price = max(round(current * 0.95, 4), 0.01)  # 5% below current, min $0.01
-                order = broker.place_option_order(
-                    option_id=option_id,
-                    side="sell",
-                    quantity=max(1, int(qty)),
-                    limit_price=str(stop_limit_price),
-                    time_in_force="day",
-                )
-                actions.append({
-                    "symbol": symbol, "action": "STOP_LOSS_CLOSE",
-                    "pnl_pct": round(pnl_pct, 2),
-                    "order_id": order.get("order_id", ""),
-                })
-            except Exception as e:
-                actions.append({"symbol": symbol, "action": "SL_ERROR", "error": str(e)})
-
-        elif symbol not in exit_symbols:
-            # No exit order — set initial stop at 50% loss
-            sl_price = round(entry * 0.50, 4)
-            try:
-                option_id = pos.get("option_id", "")
-                if not option_id:
-                    actions.append({"symbol": symbol, "action": "SL_ERROR", "error": "No option_id in position"})
-                    continue
-                
-                order = broker.place_option_order(
-                    option_id=option_id,
-                    side="sell",
-                    quantity=max(1, int(qty)),
-                    limit_price=str(round(sl_price, 4)),
-                    time_in_force="day",
-                )
-                actions.append({
-                    "symbol": symbol, "action": "SL_SET",
-                    "price": sl_price,
-                    "order_id": order.get("order_id", ""),
-                })
-            except Exception as e:
-                actions.append({"symbol": symbol, "action": "SL_ERROR", "error": str(e)})
-
-        # ── Profit-taking signals (for cron to execute) ──
+        # ── Emergency profit-taking signals (for cron to execute) ──
         if pnl_pct >= 200:
             actions.append({
                 "symbol": symbol, "action": "TP_SIGNAL",

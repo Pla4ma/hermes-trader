@@ -15,6 +15,7 @@ spec.loader.exec_module(_workflow_mod)
 
 DailyWorkflow = _workflow_mod.DailyWorkflow  # type: ignore
 
-from hermes_trader.workflow.enhanced_daily_workflow import EnhancedDailyWorkflow  # type: ignore
+# EnhancedDailyWorkflow archived — workflow.py is the single production engine.
+# from hermes_trader._archive.enhanced_daily_workflow import EnhancedDailyWorkflow
 
-__all__ = ["DailyWorkflow", "EnhancedDailyWorkflow"]
+__all__ = ["DailyWorkflow"]

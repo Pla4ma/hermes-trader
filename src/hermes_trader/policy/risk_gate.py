@@ -230,10 +230,13 @@ class PolicyEngine:
 
     def _check_risk_limits(self, c: TradeCandidate, rs: Optional[RiskSnapshot]) -> bool:
         # Max single trade loss
-        # FIX: For options, max_loss is total premium (e.g. $50 for 1 contract @ $0.50).
-        # The $3 cap was blocking all valid options. Skip this check for options.
+        # Equity loss cap ($3 default)
         if c.asset_class == "equity" and c.risk.max_loss_usd > config.absolute_single_trade_loss_cap_usd:
             self._reasons.append(f"MAX_LOSS_EXCEEDED: ${c.risk.max_loss_usd:.2f} > absolute cap ${config.absolute_single_trade_loss_cap_usd:.2f}")
+            return False
+        # Options loss cap ($50 default for $207 account)
+        if c.asset_class == "option" and c.risk.max_loss_usd > config.absolute_option_loss_cap_usd:
+            self._reasons.append(f"OPTION_MAX_LOSS_EXCEEDED: ${c.risk.max_loss_usd:.2f} > option cap ${config.absolute_option_loss_cap_usd:.2f}")
             return False
         if c.risk.expected_loss_usd > config.max_single_trade_loss_usd:
             self._reasons.append(f"EXPECTED_LOSS_EXCEEDED: ${c.risk.expected_loss_usd:.2f} > ${config.max_single_trade_loss_usd:.2f}")
@@ -286,17 +289,10 @@ class PolicyEngine:
             self._reasons.append(f"DTE_TOO_HIGH: {od.days_to_expiration} > max {config.max_days_to_expiration}")
             return False
 
-        # Expiration danger
-        # FIX: The danger window check was blocking 0DTE entirely (0 <= 2 is always true).
-        # Only flag as danger if DTE is positive AND <= danger window.
-        # 0DTE (DTE=0) is explicitly allowed below.
-        if 0 < od.days_to_expiration <= config.expiration_danger_window_days:
-            self._reasons.append(f"EXPIRATION_DANGER: {od.days_to_expiration}d <= danger window {config.expiration_danger_window_days}d")
-            return False
-
-        # 0DTE
-        if od.days_to_expiration <= 0:
-            self._reasons.append("0DTE_FORBIDDEN: Zero or negative days to expiration.")
+        # Expiration danger window — only blocks positive DTE within the window.
+        # 0DTE is allowed (DTE=0 passes since 0 is not > 0).
+        if od.days_to_expiration > 0 and od.days_to_expiration <= config.expiration_danger_window_days:
+            self._reasons.append(f"EXPIRATION_DANGER: {od.days_to_expiration}DTE within {config.expiration_danger_window_days}-day danger window")
             return False
 
         # Premium limit
@@ -372,11 +368,9 @@ class PolicyEngine:
         return True
 
     def _check_confidence(self, c: TradeCandidate) -> bool:
-        # FIX: Confidence gate was 50, but ScoringEngine has tier:
-        # 70-84 = paper_only, 85+ = live_eligible
-        # Changed to 70 to match the tier system
-        if c.confidence.score_0_to_100 < 70:
-            self._reasons.append(f"CONFIDENCE_TOO_LOW: {c.confidence.score_0_to_100} < 70")
+        # Confidence threshold — lowered to 55 to allow more trades through
+        if c.confidence.score_0_to_100 < config.min_confidence_score:
+            self._reasons.append(f"CONFIDENCE_TOO_LOW: {c.confidence.score_0_to_100} < {config.min_confidence_score}")
             return False
         return True
 

@@ -90,6 +90,9 @@ class Config:
     max_account_equity_usd = property(lambda s: _env_float("MAX_ACCOUNT_EQUITY_USD", constants.MAX_ACCOUNT_EQUITY_USD))
     max_single_trade_loss_usd = property(lambda s: _env_float("MAX_SINGLE_TRADE_LOSS_USD", constants.MAX_SINGLE_TRADE_LOSS_USD))
     absolute_single_trade_loss_cap_usd = property(lambda s: _env_float("ABSOLUTE_SINGLE_TRADE_LOSS_CAP_USD", constants.ABSOLUTE_SINGLE_TRADE_LOSS_CAP_USD))
+    absolute_option_loss_cap_usd = property(lambda s: _env_float("ABSOLUTE_OPTION_LOSS_CAP_USD", constants.ABSOLUTE_OPTION_LOSS_CAP_USD))
+    min_confidence_score = property(lambda s: int(_env_float("MIN_CONFIDENCE_SCORE", 55)))
+
     max_daily_loss_usd = property(lambda s: _env_float("MAX_DAILY_LOSS_USD", constants.MAX_DAILY_LOSS_USD))
     max_weekly_loss_usd = property(lambda s: _env_float("MAX_WEEKLY_LOSS_USD", constants.MAX_WEEKLY_LOSS_USD))
     max_monthly_loss_usd = property(lambda s: _env_float("MAX_MONTHLY_LOSS_USD", constants.MAX_MONTHLY_LOSS_USD))
@@ -103,7 +106,7 @@ class Config:
     max_equity_order_notional_usd = property(lambda s: _env_float("MAX_EQUITY_ORDER_NOTIONAL_USD", constants.MAX_EQUITY_ORDER_NOTIONAL_USD))
 
     # === Execution Advanced ===
-    initial_trade_notional = property(lambda s: float(_env_float("INITIAL_TRADE_NOTIONAL", 1000.0)))  # Aggressive: $1k
+    initial_trade_notional = property(lambda s: float(_env_float("INITIAL_TRADE_NOTIONAL", 200.0)))  # Proportional to $207 account
     allow_pyramid_scaling = property(lambda s: _env_bool("ALLOW_PYRAMID_SCALING", True))           # Aggressive: allow pyramiding
     
     # === Position Management ===
@@ -121,7 +124,7 @@ class Config:
 
     # === Momentum Agent ===
     spy_breakout_lookback_days = property(lambda s: int(_env_float("SPY_BREAKOUT_LOOKBACK_DAYS", 20)))
-    spy_breakout_trade_size = property(lambda s: float(_env_float("SPY_BREAKOUT_TRADE_SIZE", 2000.0)))  # Aggressive: $2k
+    spy_breakout_trade_size = property(lambda s: float(_env_float("SPY_BREAKOUT_TRADE_SIZE", 200.0)))  # Proportional to $207 account
 
     # === Assets ===
     allowed_underlyings = property(lambda s: _env_set("ALLOWED_UNDERLYINGS", constants.ALLOWED_UNDERLYINGS))
@@ -189,7 +192,7 @@ class Config:
     tradingagents_max_risk_rounds = property(lambda s: int(_env_float("TRADINGAGENTS_MAX_RISK_ROUNDS", "3")))     # Aggressive: 3 rounds
 
     # === Execution ===
-    max_position_notional_usd = property(lambda s: _env_float("MAX_POSITION_NOTIONAL_USD", 5000.0))  # Aggressive: $5k limit
+    max_position_notional_usd = property(lambda s: _env_float("MAX_POSITION_NOTIONAL_USD", constants.MAX_POSITION_NOTIONAL_USD))  # Use constants default ($500)
     require_market_open = property(lambda s: _env_bool("REQUIRE_MARKET_OPEN", constants.REQUIRE_MARKET_OPEN))
     allow_long_calls = property(lambda s: _env_bool("ALLOW_LONG_CALLS", constants.ALLOW_LONG_CALLS))
     allow_long_puts = property(lambda s: _env_bool("ALLOW_LONG_PUTS", constants.ALLOW_LONG_PUTS))

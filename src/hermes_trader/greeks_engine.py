@@ -1851,6 +1851,119 @@ class GreeksMarketConditions:
         }
 
 
+class GreeksCalculator:
+    """Convenient Greeks calculator wrapping BlackScholesGreeks.
+
+    Provides a clean interface for computing first-order Greeks (delta,
+    gamma, theta, vega) for a single option and for aggregating across
+    a portfolio of option positions.
+    """
+
+    DEFAULT_RISK_FREE: float = 0.05
+    DEFAULT_DIVIDEND_YIELD: float = 0.00
+
+    @classmethod
+    def calculate_greeks(
+        cls,
+        S: float,
+        K: float,
+        sigma: float,
+        tau: float,
+        option_type: str = "call",
+        r: Optional[float] = None,
+        q: Optional[float] = None,
+    ) -> dict:
+        """Compute Black-Scholes Greeks for a single option.
+
+        Args:
+            S: Current underlying price.
+            K: Strike price.
+            sigma: Implied volatility (annualised decimal).
+            tau: Time to expiry in years (e.g. 30/365 for 30 DTE).
+            option_type: ``"call"`` or ``"put"``.
+            r: Risk-free rate (default 5%).
+            q: Dividend yield (default 0%).
+
+        Returns:
+            dict with keys: delta, gamma, theta, vega, price.
+        """
+        if r is None:
+            r = cls.DEFAULT_RISK_FREE
+        if q is None:
+            q = cls.DEFAULT_DIVIDEND_YIELD
+
+        return {
+            "delta": BlackScholesGreeks.delta(S, K, r, q, sigma, tau, option_type),
+            "gamma": BlackScholesGreeks.gamma(S, K, r, q, sigma, tau),
+            "theta": BlackScholesGreeks.theta(S, K, r, q, sigma, tau, option_type),
+            "vega": BlackScholesGreeks.vega(S, K, r, q, sigma, tau),
+            "price": BlackScholesGreeks.price(S, K, r, q, sigma, tau, option_type),
+        }
+
+    @classmethod
+    def compute_position_greeks(
+        cls,
+        positions: List[dict],
+        r: Optional[float] = None,
+        q: Optional[float] = None,
+    ) -> dict:
+        """Aggregate Greeks for a list of option positions.
+
+        Each element in *positions* should have at least:
+            S, K, sigma, tau, contracts (positive=long, negative=short),
+            option_type (default ``"call"``).
+
+        Multiplier of 100 is applied per contract (standard US equity options).
+
+        Returns:
+            dict with net_greeks, per_position list, and summary stats.
+        """
+        if r is None:
+            r = cls.DEFAULT_RISK_FREE
+        if q is None:
+            q = cls.DEFAULT_DIVIDEND_YIELD
+
+        net = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+        per_position = []
+
+        for pos in positions:
+            S = pos["S"]
+            K = pos["K"]
+            sigma = pos["sigma"]
+            tau = pos["tau"]
+            contracts = pos.get("contracts", 1)
+            option_type = pos.get("option_type", pos.get("type", "call"))
+            direction = pos.get("direction", "long")
+            sign = 1 if direction == "long" else -1
+
+            d = BlackScholesGreeks.delta(S, K, r, q, sigma, tau, option_type) * sign * contracts * 100
+            g = BlackScholesGreeks.gamma(S, K, r, q, sigma, tau) * sign * contracts * 100
+            t = BlackScholesGreeks.theta(S, K, r, q, sigma, tau, option_type) * sign * contracts * 100
+            v = BlackScholesGreeks.vega(S, K, r, q, sigma, tau) * sign * contracts * 100
+
+            net["delta"] += d
+            net["gamma"] += g
+            net["theta"] += t
+            net["vega"] += v
+
+            per_position.append({
+                "S": S,
+                "K": K,
+                "sigma": sigma,
+                "tau": tau,
+                "contracts": contracts,
+                "option_type": option_type,
+                "direction": direction,
+                "greeks": {"delta": d, "gamma": g, "theta": t, "vega": v},
+            })
+
+        return {
+            "net_greeks": net,
+            "positions": per_position,
+            "num_positions": len(positions),
+        }
+
+
 # ============================================================================
 # MAIN: DEMONSTRATE ALL CAPABILITIES
 # ============================================================================

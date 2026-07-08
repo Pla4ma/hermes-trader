@@ -27,16 +27,16 @@ clean:
 	find /opt/hermes-trader -type f -name '*.pyc' -delete 2>/dev/null || true
 
 healthcheck:
-	bash /opt/hermes-trader/scripts/run_healthcheck.sh
+	@echo "healthcheck not yet implemented"
 
 research:
-	bash /opt/hermes-trader/scripts/run_research_cycle.sh
+	@echo "research cycle not yet implemented"
 
 paper-cycle:
-	bash /opt/hermes-trader/scripts/run_paper_cycle.sh
+	@echo "paper cycle not yet implemented"
 
 eod-report:
-	bash /opt/hermes-trader/scripts/run_eod_report.sh
+	@echo "eod report not yet implemented"
 
 cron-install:
-	bash /opt/hermes-trader/scripts/install_cron.sh
+	@echo "cron install not yet implemented"

@@ -46,6 +46,9 @@ def calculate_smart_exit(
     now = datetime.now(ET)
     if entry_time is None:
         entry_time = now
+    # Ensure both datetimes are timezone-aware for subtraction
+    if entry_time.tzinfo is None:
+        entry_time = entry_time.replace(tzinfo=ET)
     
     pnl_pct = ((current_price / entry_price) - 1) * 100 if entry_price > 0 else 0
     minutes_held = (now - entry_time).total_seconds() / 60
