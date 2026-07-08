@@ -128,19 +128,23 @@ def gate_time(now_et: datetime) -> Tuple[bool, str]:
     """Gate 1: Only trade during optimal windows.
 
     Windows:
-      - 9:45-10:30 AM ET (post-open momentum, ORB established)
+      - 9:35-10:30 AM ET (early momentum — biggest moves happen here)
       - 2:00-3:30 PM ET (afternoon trend, before power hour chaos)
 
     BLOCKS:
-      - Before 9:45 (opening chaos, spreads wide)
+      - 9:30-9:35 (first 5 min = pure chaos, algo wars, wide spreads)
       - 10:30-2:00 PM (lunch chop, low conviction)
       - After 3:30 PM (theta crush, pin risk)
+
+    NOTE: Changed from 9:45 to 9:35 because the biggest moves (like
+    today's QQQ -2% crash) happen in the first 15 minutes. Waiting
+    until 9:45 means missing the real money.
     """
     hour = now_et.hour
     minute = now_et.minute
 
-    # Morning window: 9:45 - 10:30
-    morning_ok = (hour == 9 and minute >= 45) or (hour == 10 and minute <= 30)
+    # Morning window: 9:35 - 10:30 (was 9:45, moved earlier to catch early moves)
+    morning_ok = (hour == 9 and minute >= 35) or (hour == 10 and minute <= 30)
     # Afternoon window: 2:00 - 3:30
     afternoon_ok = (hour == 14) or (hour == 15 and minute <= 30)
 
